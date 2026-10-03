@@ -1,0 +1,49 @@
+# openab-sb.toml — every credential here is a verifier (`sha256:…`), never a secret.
+# Make pairs with `openab-sb gen-secret`; the secret goes to the other party.
+
+# Loopback by default. Front it with `tailscale serve` or a tunnel for TLS.
+listen = "127.0.0.1:8790"
+# allow_insecure_bind = true   # only for a private network, bearer tokens in clear
+
+# Requests in flight toward the VM; extra calls are rejected, not queued.
+max_inflight = 8
+
+# Audit log: JSON lines. Omit for stdout. `audit_args = false` drops call arguments
+# (e.g. text typed with `key`) from the log.
+# audit_path = "~/.local/state/openab-sb/audit.jsonl"
+audit_args = true
+
+[vm]
+# The dial-out daemon presents the matching secret on `GET /vm/attach`.
+secret_sha256 = "sha256:REPLACE_ME"
+
+[timeouts]
+default_secs = 60   # any tool without its own entry
+control_secs = 15   # tools/list
+[timeouts.tools]
+screenshot = 10
+bash = 60
+
+# Northbound callers: POST /mcp with `Authorization: Bearer <token>`.
+# `tools` is the allowlist ("*" = all). `vm_status` is always available.
+# An allowlist is policy, not isolation: `key` and `mouse` can reach a shell.
+[[client]]
+name = "connect"
+token_sha256 = "sha256:REPLACE_ME"
+tools = ["sys_info", "screenshot", "mouse", "key"]
+
+[[client]]
+name = "agent"
+token_sha256 = "sha256:REPLACE_ME"
+tools = ["*"]
+
+# Lend the VM to an openab-pty session (CLIENT-CONTRACT §9). The switchboard
+# dials the pod; the secret comes from
+#   POST /admin/sessions/{session}/tools-attach
+# and is re-read from `secret_file` on every dial, so re-minting heals in place.
+# [[pty_attach]]
+# name = "kiro-1040"
+# url = "wss://kiro-1040.<tailnet>.ts.net/tools/attach/laptop"
+# secret_file = "~/.config/openab-sb/kiro-1040.secret"
+# tools = ["*"]
+# allow_insecure_transport = false   # true to allow ws:// to a tailnet IP

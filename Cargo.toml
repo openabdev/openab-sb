@@ -1,0 +1,32 @@
+[package]
+name = "openab-sb"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/openabdev/openab-sb"
+description = "OpenAB Switchboard: relays MCP tool calls to a machine that can only dial out"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+axum = { version = "0.8", features = ["ws"] }
+tokio-tungstenite = { version = "0.30", features = ["rustls-tls-webpki-roots"] }
+# tokio-tungstenite's rustls is built without a crypto provider; pick ring
+# (no cmake/NASM needed, cross-compiles cleanly) and install it at startup.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+futures-util = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+anyhow = "1"
+parking_lot = "0.12"
+clap = { version = "4", features = ["derive"] }
+subtle = "2"
+sha2 = "0.11"
+hex = "0.4"
+getrandom = "0.3"
+chrono = "0.4"
+
+[dev-dependencies]
+reqwest = { version = "0.12", default-features = false, features = ["json"] }
