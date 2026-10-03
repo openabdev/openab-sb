@@ -17,15 +17,22 @@ use crate::config::PtyAttach;
 use crate::mcp::Mcp;
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Semaphore};
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::http::HeaderValue;
 use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 use tokio_tungstenite::tungstenite::{Error as WsError, Message};
 
-/// Close codes from openab-pty after which redialling is pointless.
-const STOP_CODES: [u16; 4] = [4001, 4002, 4004, 4010];
+/// The one application close code after which openab-pty wants a redial
+/// (`4006`, runtime replaced). Every other `4xxx` means stop (§9.2): grant
+/// expired or revoked, replaced by another dialer, session ended, or a code
+/// this build does not know yet — guessing "retry" there would fight the pod.
+const REDIAL_CODE: u16 = 4006;
+/// Requests from one pod handled concurrently; past this the pod gets
+/// `-32002` at once. Matches openab-pty's own per-session cap.
+const MAX_CONCURRENT_POD_REQUESTS: usize = 64;
 const BACKOFF_START: Duration = Duration::from_secs(1);
 const BACKOFF_MAX: Duration = Duration::from_secs(60);
 /// A session that stayed up this long resets the backoff.
@@ -56,7 +63,7 @@ async fn run(mcp: Mcp, attach: PtyAttach, audit: Audit) {
         let started = Instant::now();
         let ended = dial_once(&mcp, &attach, &audit).await;
         let wait = match &ended {
-            Ended::Closed(Some(code)) if STOP_CODES.contains(code) => {
+            Ended::Closed(Some(code)) if is_stop_code(*code) => {
                 tracing::info!(attach = %name, code, "openab-pty ended the attach; not redialling");
                 audit.event(
                     "pty_attach_stopped",
@@ -75,14 +82,17 @@ async fn run(mcp: Mcp, attach: PtyAttach, audit: Audit) {
             // re-mints and rewrites `secret_file`; poll slowly (the pod throttles
             // at five failed upgrades a minute).
             Ended::Refused(status) => {
+                tracing::warn!(attach = %name, status, "openab-pty refused the attach; waiting for a fresh grant");
                 audit.event(
                     "pty_attach_refused",
                     json!({ "attach": name, "status": status }),
                 );
                 BACKOFF_MAX
             }
+            // Backoff caps at a minute, so warning each time stays bounded and a
+            // wrong URL or a missing secret_file is visible at the default level.
             Ended::Failed(error) => {
-                tracing::debug!(attach = %name, %error, "openab-pty dial failed");
+                tracing::warn!(attach = %name, %error, "openab-pty dial failed");
                 backoff
             }
         };
@@ -131,6 +141,7 @@ async fn dial_once(mcp: &Mcp, attach: &PtyAttach, audit: &Audit) -> Ended {
         let _ = sink.close().await;
     });
 
+    let permits = Arc::new(Semaphore::new(MAX_CONCURRENT_POD_REQUESTS));
     let mut keepalive = tokio::time::interval(KEEPALIVE);
     keepalive.tick().await;
     let mut last_heard = Instant::now();
@@ -151,10 +162,18 @@ async fn dial_once(mcp: &Mcp, attach: &PtyAttach, audit: &Audit) -> Ended {
                 // Requests from the pod run concurrently: a slow screenshot must
                 // not hold up a quick `tools/list`.
                 if let Some(request) = value.filter(|v| v.get("method").is_some()) {
+                    let Ok(permit) = permits.clone().try_acquire_owned() else {
+                        if let Some(id) = request.get("id").cloned() {
+                            let busy = crate::hub::rpc_error(id, -32002, "too many requests in flight on this attach");
+                            let _ = out_tx.try_send(Message::Text(busy.to_string().into()));
+                        }
+                        continue;
+                    };
                     let mcp = mcp.clone();
                     let principal = attach.principal.clone();
                     let out = out_tx.clone();
                     tokio::spawn(async move {
+                        let _permit = permit;
                         if let Some(response) = mcp.handle(&principal, request).await {
                             let _ = out.send(Message::Text(response.to_string().into())).await;
                         }
@@ -165,8 +184,9 @@ async fn dial_once(mcp: &Mcp, attach: &PtyAttach, audit: &Audit) -> Ended {
                 if last_heard.elapsed() > IDLE_LIMIT {
                     break Ended::Closed(None);
                 }
-                // Also flushes any pong tungstenite queued while reading.
-                let _ = out_tx.send(Message::Ping(Vec::new().into())).await;
+                // Also flushes any pong tungstenite queued while reading. Never
+                // block the read loop on a full queue: skip this ping instead.
+                let _ = out_tx.try_send(Message::Ping(Vec::new().into()));
             }
         }
     };
@@ -179,6 +199,10 @@ async fn dial_once(mcp: &Mcp, attach: &PtyAttach, audit: &Audit) -> Ended {
     ended
 }
 
+fn is_stop_code(code: u16) -> bool {
+    (4000..5000).contains(&code) && code != REDIAL_CODE
+}
+
 fn jitter(base: Duration) -> Duration {
     let mut raw = [0u8; 2];
     let spread = if getrandom::fill(&mut raw).is_ok() {
@@ -188,4 +212,19 @@ fn jitter(base: Duration) -> Duration {
     };
     // ±20 %
     base.mul_f64(0.8 + 0.4 * spread)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stops_on_every_4xxx_except_runtime_replaced() {
+        for code in [4001, 4002, 4003, 4004, 4005, 4010, 4999] {
+            assert!(is_stop_code(code), "{code}");
+        }
+        for code in [4006, 1000, 1001, 1006, 1011] {
+            assert!(!is_stop_code(code), "{code}");
+        }
+    }
 }

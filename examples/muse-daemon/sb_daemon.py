@@ -22,6 +22,7 @@ import os
 import platform
 import random
 import shutil
+import signal
 import socket
 import sys
 import time
@@ -32,6 +33,7 @@ VERSION = "0.1.0"
 PROTOCOL = "2025-06-18"
 MAX_OUTPUT = 256 * 1024
 STOP_CODES = {4002, 4003}  # replaced / revoked: another daemon or the operator decided
+# 4005 (handshake failed) and everything else: redial with backoff.
 UNAUTHORIZED_RETRY = 300   # seconds; a wrong secret needs a human, not a hammer
 
 
@@ -44,16 +46,22 @@ class ToolError(Exception):
 
 
 async def run(*argv, stdin=None, timeout=30):
+    # Own process group, so a timeout kills everything the command started
+    # (`bash -lc 'sleep 999 &'` must not outlive it).
     proc = await asyncio.create_subprocess_exec(
         *argv,
-        stdin=asyncio.subprocess.PIPE if stdin is not None else None,
+        stdin=asyncio.subprocess.PIPE if stdin is not None else asyncio.subprocess.DEVNULL,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
+        start_new_session=True,
     )
     try:
         out, err = await asyncio.wait_for(proc.communicate(stdin), timeout)
     except asyncio.TimeoutError:
-        proc.kill()
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
         await proc.wait()
         raise ToolError(f"{argv[0]} timed out after {timeout}s")
     return proc.returncode, out, err
@@ -108,9 +116,13 @@ async def screenshot(args):
     fmt = "png" if args.get("format") == "png" else "jpeg"
     argv = ["import", "-silent", "-window", "root"]
     region = args.get("region")
+    src_w, src_h = pts
     if region:
         x, y, w, h = (int(region[k]) for k in ("x", "y", "width", "height"))
+        if w <= 0 or h <= 0 or x < 0 or y < 0:
+            raise ToolError("region must have x,y >= 0 and positive width/height")
         argv += ["-crop", f"{w}x{h}+{x}+{y}", "+repage"]
+        src_w, src_h = min(w, pts[0] - x), min(h, pts[1] - y)
     argv += ["-resize", f"{scale * 100:.1f}%"]
     if fmt == "jpeg":
         argv += ["-quality", str(int(quality * 100))]
@@ -122,7 +134,10 @@ async def screenshot(args):
         {"type": "image", "data": base64.b64encode(data).decode(), "mimeType": f"image/{fmt}"},
         text(f"{pts[0]}x{pts[1]} {fmt} {len(data)} bytes"),
     ]
-    return content, {"points": {"width": pts[0], "height": pts[1]}, "image": {"bytes": len(data)}}
+    # ImageMagick's percentage resize rounds to the nearest pixel.
+    image = {"width": max(1, round(src_w * scale)), "height": max(1, round(src_h * scale)),
+             "bytes": len(data)}
+    return content, {"points": {"width": pts[0], "height": pts[1]}, "image": image}
 
 
 MODS = {"cmd": "super", "super": "super", "ctrl": "ctrl", "alt": "alt", "option": "alt", "shift": "shift"}
@@ -199,7 +214,8 @@ async def key(args):
         keys = [xkey(k) for k in args.get("keys") or []]
         if not keys:
             raise ToolError("keys is required")
-        await xdotool("key", "--delay", str(int(args.get("delay_ms", 50))), *keys)
+        # `--` so a "key" like `--window` is a keysym, never an xdotool option.
+        await xdotool("key", "--delay", str(int(args.get("delay_ms", 50))), "--", *keys)
         return [text("pressed " + " ".join(keys))], None
     raise ToolError(f"unknown action {action!r}")
 
@@ -270,8 +286,11 @@ async def answer(msg):
                 result["structuredContent"] = structured
         except ToolError as e:
             result = {"content": [text(str(e))], "isError": True}
-        except (ValueError, KeyError, TypeError) as e:
+        except (ValueError, KeyError, TypeError, AttributeError) as e:
             return {"jsonrpc": "2.0", "id": mid, "error": {"code": -32602, "message": f"invalid params: {e}"}}
+        except Exception as e:  # noqa: BLE001 — answer, never leave the caller to time out
+            log("tool", name, "crashed:", type(e).__name__, e)
+            return {"jsonrpc": "2.0", "id": mid, "error": {"code": -32603, "message": f"internal error in {name}"}}
     else:
         return {"jsonrpc": "2.0", "id": mid, "error": {"code": -32601, "message": f"method {method!r} not found"}}
     return {"jsonrpc": "2.0", "id": mid, "result": result}
@@ -290,7 +309,7 @@ async def session(ws):
             msg = json.loads(raw)
         except ValueError:
             continue
-        if "method" not in msg:
+        if not isinstance(msg, dict) or not isinstance(msg.get("method"), str):
             continue  # responses to requests we never send
         if msg["method"] == "initialize":
             await handle(msg)  # answer the handshake before anything else

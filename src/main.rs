@@ -52,11 +52,38 @@ fn main() -> Result<()> {
         }
         Command::Check { config } => {
             let parsed = Config::load(&config)?;
+            let mut problems = 0;
+            for attach in &parsed.pty_attach {
+                match std::fs::read_to_string(&attach.secret_file) {
+                    Ok(text) if !text.trim().is_empty() => {}
+                    Ok(_) => {
+                        problems += 1;
+                        eprintln!(
+                            "warning: [[pty_attach]] {:?}: {} is empty",
+                            attach.principal.name,
+                            attach.secret_file.display()
+                        );
+                    }
+                    Err(error) => {
+                        problems += 1;
+                        eprintln!(
+                            "warning: [[pty_attach]] {:?}: cannot read {}: {error}",
+                            attach.principal.name,
+                            attach.secret_file.display()
+                        );
+                    }
+                }
+            }
             println!(
-                "ok: listen {}, {} client(s), {} pty attach(es)",
+                "ok: listen {}, {} client(s), {} pty attach(es){}",
                 parsed.listen,
                 parsed.auth.clients.len(),
-                parsed.pty_attach.len()
+                parsed.pty_attach.len(),
+                if problems > 0 {
+                    format!(", {problems} warning(s)")
+                } else {
+                    String::new()
+                }
             );
             Ok(())
         }

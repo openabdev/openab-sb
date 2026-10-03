@@ -125,14 +125,18 @@ impl Sb {
         names
     }
 
-    async fn healthz(&self) -> u16 {
+    async fn get(&self, path: &str) -> u16 {
         self.http
-            .get(format!("http://{}/healthz", self.addr))
+            .get(format!("http://{}{path}", self.addr))
             .send()
             .await
             .unwrap()
             .status()
             .as_u16()
+    }
+
+    async fn readyz(&self) -> u16 {
+        self.get("/readyz").await
     }
 
     async fn status(&self) -> Value {
@@ -166,8 +170,8 @@ impl Sb {
 
     async fn wait_for_health(&self, want: u16) {
         let deadline = Instant::now() + Duration::from_secs(5);
-        while self.healthz().await != want {
-            assert!(Instant::now() < deadline, "healthz never became {want}");
+        while self.readyz().await != want {
+            assert!(Instant::now() < deadline, "readyz never became {want}");
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
     }
@@ -308,7 +312,18 @@ async fn fake_vm(addr: SocketAddr, secret: &str, name: &str) -> Result<FakeVm, u
 #[tokio::test]
 async fn offline_surface_is_honest_and_closed() {
     let sb = start().await;
-    assert_eq!(sb.healthz().await, 503);
+    assert_eq!(sb.readyz().await, 503);
+    // Liveness does not depend on the VM: Connect probes it before sys_info,
+    // so "VM offline" must reach Connect as a tool error, not "unreachable".
+    assert_eq!(sb.get("/healthz").await, 200);
+    let info = sb
+        .call(CONNECT_TOKEN, json!(0), "sys_info", json!({}))
+        .await;
+    assert_eq!(info["result"]["isError"], true);
+    assert!(info["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap()
+        .contains("not connected"));
 
     // No token / wrong token.
     let response = sb
@@ -361,6 +376,16 @@ async fn offline_surface_is_honest_and_closed() {
         .await
         .unwrap();
     assert_eq!(response.status().as_u16(), 202);
+    // A JSON-RPC response from the client is accepted the same way.
+    let response = sb
+        .http
+        .post(format!("http://{}/mcp", sb.addr))
+        .bearer_auth(CONNECT_TOKEN)
+        .json(&json!({"jsonrpc":"2.0","id":99,"result":{}}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status().as_u16(), 202);
     let (_, other) = sb
         .rpc(
             CONNECT_TOKEN,
@@ -391,7 +416,7 @@ async fn vm_needs_its_own_secret() {
     let sb = start().await;
     assert_eq!(fake_vm(sb.addr, "wrong", "x").await.err(), Some(401));
     assert_eq!(fake_vm(sb.addr, CONNECT_TOKEN, "x").await.err(), Some(401));
-    assert_eq!(sb.healthz().await, 503);
+    assert_eq!(sb.readyz().await, 503);
 }
 
 #[tokio::test]
@@ -399,7 +424,7 @@ async fn allowlist_filters_listing_and_blocks_calls_before_the_vm() {
     let sb = start().await;
     let vm = fake_vm(sb.addr, VM_SECRET, "fake-vm").await.unwrap();
     sb.wait_for_vm("fake-vm").await;
-    assert_eq!(sb.healthz().await, 200);
+    assert_eq!(sb.readyz().await, 200);
 
     // Connect sees only its allowlist; the VM's own `vm_status` is replaced by ours.
     assert_eq!(
@@ -531,7 +556,7 @@ async fn takeover_closes_the_old_vm_without_hurting_the_new_one() {
     sb.wait_for_vm("vm-new").await;
     // The old socket's cleanup must not have emptied the slot.
     tokio::time::sleep(Duration::from_millis(200)).await;
-    assert_eq!(sb.healthz().await, 200);
+    assert_eq!(sb.readyz().await, 200);
     let routed = sb.call(PTY_TOKEN, json!(2), "sys_info", json!({})).await;
     assert_eq!(routed["result"]["structuredContent"]["vm"], "vm-new");
     assert_eq!(new.calls.load(Ordering::SeqCst), 1);
@@ -561,7 +586,7 @@ async fn rotating_the_vm_secret_on_reload_evicts_the_attached_vm() {
     sb.app
         .reload_auth(Config::parse(&config_text("", "")).unwrap().auth);
     tokio::time::sleep(Duration::from_millis(100)).await;
-    assert_eq!(sb.healthz().await, 200);
+    assert_eq!(sb.readyz().await, 200);
 
     let rotated = config_text("", "").replace(
         &Verifier::of_secret(VM_SECRET).render(),
@@ -701,5 +726,86 @@ async fn pty_attach_redials_after_a_plain_drop() {
     drop(ws); // runtime replaced / network blip
     let again = tokio::time::timeout(Duration::from_secs(5), pod.accept()).await;
     assert!(again.is_ok(), "did not redial after a drop");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn a_vm_that_refuses_the_handshake_is_closed_not_left_attached() {
+    let sb = start().await;
+    let mut request = format!("ws://{}/vm/attach", sb.addr)
+        .into_client_request()
+        .unwrap();
+    request.headers_mut().insert(
+        "authorization",
+        HeaderValue::from_str(&format!("Bearer {VM_SECRET}")).unwrap(),
+    );
+    let (mut ws, _) = tokio_tungstenite::connect_async(request).await.unwrap();
+    let code = tokio::time::timeout(Duration::from_secs(5), async {
+        while let Some(Ok(frame)) = ws.next().await {
+            match frame {
+                Message::Text(text) => {
+                    let msg: Value = serde_json::from_str(&text).unwrap();
+                    if msg["method"] == "initialize" {
+                        let refuse = json!({"jsonrpc":"2.0","id":msg["id"],
+                            "error":{"code":-32602,"message":"unsupported protocol version"}});
+                        ws.send(Message::Text(refuse.to_string().into()))
+                            .await
+                            .unwrap();
+                    }
+                }
+                Message::Close(frame) => return frame.map(|f| u16::from(f.code)),
+                _ => {}
+            }
+        }
+        None
+    })
+    .await
+    .expect("switchboard kept a VM that failed the handshake");
+    assert_eq!(code, Some(4005));
+    sb.wait_for_health(503).await;
+    assert_eq!(sb.status().await["vm"]["attached"], false);
+}
+
+/// Accept one dial on `pod` as openab-pty would, then close with `code`.
+async fn pod_accept_then_close(pod: &tokio::net::TcpListener, code: u16) {
+    let (tcp, _) = tokio::time::timeout(Duration::from_secs(5), pod.accept())
+        .await
+        .expect("switchboard did not dial the pod")
+        .unwrap();
+    let mut ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
+    ws.close(Some(CloseFrame {
+        code: CloseCode::from(code),
+        reason: "".into(),
+    }))
+    .await
+    .unwrap();
+    // Let the close handshake finish.
+    let _ = tokio::time::timeout(Duration::from_secs(1), ws.next()).await;
+}
+
+async fn sb_dialling(pod_addr: SocketAddr, tag: &str) -> (Sb, std::path::PathBuf) {
+    let dir = std::env::temp_dir().join(format!("openab-sb-{tag}-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let secret_file = dir.join("pod.secret");
+    std::fs::write(&secret_file, "s").unwrap();
+    let attach = format!(
+        "[[pty_attach]]\nname = \"kiro-pod\"\nurl = \"ws://{pod_addr}/tools/attach/x\"\nsecret_file = \"{}\"\ntools = [\"*\"]\n",
+        secret_file.display()
+    );
+    (start_with(&config_text("", &attach)).await, dir)
+}
+
+#[tokio::test]
+async fn pty_attach_redials_on_runtime_replaced_and_stops_on_other_4xxx() {
+    let pod = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let (_sb, dir) = sb_dialling(pod.local_addr().unwrap(), "codes").await;
+
+    // 4006: the pod was replaced; the switchboard must come back.
+    pod_accept_then_close(&pod, 4006).await;
+    // 4003 is not a code openab-pty sends today; §9.2 says stop on any 4xxx
+    // but 4006, so an unknown one must not be redialled either.
+    pod_accept_then_close(&pod, 4003).await;
+    let again = tokio::time::timeout(Duration::from_secs(4), pod.accept()).await;
+    assert!(again.is_err(), "redialled after 4003");
     let _ = std::fs::remove_dir_all(&dir);
 }

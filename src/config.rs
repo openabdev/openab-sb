@@ -264,21 +264,39 @@ impl Config {
                 bail!("{owner}: name is already used by a client or attach");
             }
             let insecure_ok = p.allow_insecure_transport;
-            if let Some(rest) = p.url.strip_prefix("ws://") {
-                let host = rest.split(['/', ':']).next().unwrap_or_default();
-                let loopback = host == "localhost"
-                    || host
-                        .parse::<std::net::IpAddr>()
-                        .is_ok_and(|ip| ip.is_loopback());
-                if !loopback && !insecure_ok {
-                    bail!(
-                        "{owner}: `ws://` to a non-loopback host sends the attach secret in \
-                         clear; use `wss://` or set `allow_insecure_transport = true` \
-                         (acceptable over a tailnet IP)"
-                    );
+            let uri: tokio_tungstenite::tungstenite::http::Uri = p
+                .url
+                .parse()
+                .with_context(|| format!("{owner}: `url` is not a valid URL"))?;
+            let host = uri
+                .host()
+                .with_context(|| format!("{owner}: `url` has no host"))?;
+            let host = host.trim_start_matches('[').trim_end_matches(']');
+            match uri.scheme_str() {
+                Some("wss") => {}
+                Some("ws") => {
+                    let loopback = host == "localhost"
+                        || host
+                            .parse::<std::net::IpAddr>()
+                            .is_ok_and(|ip| ip.is_loopback());
+                    if !loopback && !insecure_ok {
+                        bail!(
+                            "{owner}: `ws://` to a non-loopback host sends the attach secret in \
+                             clear; use `wss://` or set `allow_insecure_transport = true` \
+                             (acceptable over a tailnet IP)"
+                        );
+                    }
                 }
-            } else if !p.url.starts_with("wss://") {
-                bail!("{owner}: `url` must be ws:// or wss://");
+                _ => bail!("{owner}: `url` must be ws:// or wss://"),
+            }
+            if pty_attach
+                .iter()
+                .any(|other: &PtyAttach| other.url == p.url)
+            {
+                bail!(
+                    "{owner}: another [[pty_attach]] already dials this url; \
+                     two dialers on one session evict each other"
+                );
             }
             pty_attach.push(PtyAttach {
                 principal: Principal {
@@ -379,6 +397,15 @@ mod tests {
         assert!(Config::parse(&base(&attach_ok)).is_ok());
         let local = "[[pty_attach]]\nname = \"pod\"\nurl = \"ws://127.0.0.1:8091/tools/attach/s\"\nsecret_file = \"/tmp/x\"\ntools = [\"*\"]\n";
         assert!(Config::parse(&base(local)).is_ok());
+        let v6 = "[[pty_attach]]\nname = \"pod\"\nurl = \"ws://[::1]:8091/tools/attach/s\"\nsecret_file = \"/tmp/x\"\ntools = [\"*\"]\n";
+        assert!(Config::parse(&base(v6)).is_ok(), "[::1] is loopback");
+        let dup = format!("{local}[[pty_attach]]\nname = \"pod2\"\nurl = \"ws://127.0.0.1:8091/tools/attach/s\"\nsecret_file = \"/tmp/x\"\ntools = [\"*\"]\n");
+        assert!(
+            Config::parse(&base(&dup)).is_err(),
+            "two dialers on one session"
+        );
+        let http = "[[pty_attach]]\nname = \"pod\"\nurl = \"https://x/tools/attach/s\"\nsecret_file = \"/tmp/x\"\ntools = [\"*\"]\n";
+        assert!(Config::parse(&base(http)).is_err());
     }
 
     #[test]

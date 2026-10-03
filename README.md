@@ -23,8 +23,10 @@ does not store anything.
   in [`docs/SOUTHBOUND-CONTRACT.md`](docs/SOUTHBOUND-CONTRACT.md), and a reference daemon is
   in [`examples/muse-daemon/`](examples/muse-daemon/sb_daemon.py).
 - **Northbound for Connect:** add a computer in Connect with URL `https://<switchboard>/mcp`
-  and a client token. Connect calls `sys_info` and `screenshot`; `GET /healthz` reports
-  whether the VM is online.
+  and a client token. Connect calls `sys_info` and `screenshot`. While the VM is offline,
+  Connect still finds the switchboard (`/healthz` is 200) and shows the tool error "the VM
+  is not connected" rather than "unreachable". `GET /readyz` is the VM-online probe for
+  monitoring.
 - **Northbound for PTY:** this needs no change to openab-pty. The switchboard plays the
   "Mac" in openab-pty's tools plane (`CLIENT-CONTRACT.md` §9). It dials the pod's
   `/tools/attach/{session}` and serves the VM's tools there, so the CLI in that session
@@ -35,15 +37,16 @@ does not store anything.
 
 | | |
 |---|---|
-| VMs | one at a time. A newer attach replaces the older one (`4002`), and the older socket's cleanup never touches the newer one |
+| VMs | one at a time. A newer attach replaces the older one (`4002`), and the older socket's cleanup never touches the newer one. A VM that fails the MCP handshake is closed with `4005` |
 | ids | rewritten per call, so callers sharing one socket cannot collide |
 | methods | `initialize` and `ping` are answered locally, `tools/list` is filtered, `tools/call` is policed. Everything else gets `-32601` and is not forwarded |
 | policy | a per-caller tool allowlist, checked before the request reaches the VM. `vm_status` is always available |
 | limits | `max_inflight` (default 8, extra calls are rejected); per-tool timeouts (`screenshot` 10 s, default 60 s); 16 MiB frames from the VM |
 | failures | `-32001` VM offline (returned as a tool error so clients keep the server), `-32002` overloaded, `-32003` timed out, `-32004` VM disconnected mid-call. Nothing is retried |
 | state | memory only. A restart fails every in-flight call |
-| audit | JSON lines: attach, detach, takeover, auth failures, and every `tools/call` with caller, tool, outcome, latency, size, and (optionally) arguments. Results are never logged |
-| reload | `SIGHUP` re-reads credentials. A VM attached with a rotated-out secret is closed with `4003` |
+| audit | JSON lines, file mode `0600`: attach, detach, takeover, auth failures (capped at 20 a minute, the rest summarised), and every `tools/call` with caller, tool, outcome, latency, size, and (optionally) arguments. Results are never logged |
+| reload | `SIGHUP` re-reads credentials. A VM attached with a rotated-out secret is closed with `4003`, including one whose upgrade was authenticated just before the reload |
+| PTY attach | redials with backoff on drops and on `4006` (pod replaced); stops on every other `4xxx`, per openab-pty §9.2. At most 64 requests from one pod are handled at once |
 
 ## Run
 
@@ -64,8 +67,8 @@ The switchboard binds loopback and refuses anything else unless you set
   `cloudflared`. The bearer tokens are then the only gate, so keep them long (the generated
   ones are 256-bit) and rotate them with `SIGHUP`.
 
-Routes: `POST /mcp`, `GET /vm/attach`, `GET /healthz` (no auth), `GET /livez` (no auth),
-`GET /status` (client token).
+Routes: `POST /mcp`, `GET /vm/attach`, `GET /healthz` (no auth, liveness), `GET /readyz`
+(no auth, 200 only when the VM is attached and initialised), `GET /status` (client token).
 
 ## Trust
 

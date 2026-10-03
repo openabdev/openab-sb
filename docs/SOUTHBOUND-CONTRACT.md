@@ -51,7 +51,7 @@ Once attached, **the switchboard is the MCP client and you are the MCP server.**
    server would; the `serverInfo` you return is shown to callers in `vm_status`. Answer
    `initialize` **before** any other request.
 2. The switchboard then sends `notifications/initialized`. No reply.
-3. Every subsequent request (`tools/list`, `tools/call`, `ping`) carries a
+3. Every subsequent request (`tools/list`, `tools/call`) carries a
    **switchboard-assigned integer `id`**. Reply with exactly that `id`. Ids are rewritten on
    the switchboard; they never match what the end caller sent, and you must not care.
 4. Requests may arrive **concurrently** — a screenshot poll and a shell command can be in
@@ -60,8 +60,10 @@ Once attached, **the switchboard is the MCP client and you are the MCP server.**
 5. Notifications you send (e.g. `notifications/tools/list_changed`) are accepted and
    dropped. Requests you send are answered `-32601`, except `ping`, which is answered `{}`.
 
-Only three methods reach you: `tools/list`, `tools/call`, `ping` (plus the handshake). Other
-MCP methods are refused by the switchboard before they reach you.
+Only `tools/list` and `tools/call` reach you, plus the handshake. Callers' `ping` and every
+other MCP method are answered or refused by the switchboard itself. Nothing is sent to you
+before you answer `initialize`; if you refuse it, or do not answer within 15 s, the socket is
+closed with `4005`.
 
 ### Limits the switchboard enforces (you are not told)
 
@@ -143,6 +145,7 @@ runs at boot — cron `@reboot`, systemd, a skill hook).
 |---|---|---|
 | `4002` | replaced: another daemon attached with the same secret | **stop**. Two dialers fighting is a bug; the newer one wins |
 | `4003` | the operator revoked or rotated the secret | stop until the secret is updated |
+| `4005` | your `initialize` reply was an error or did not arrive in 15 s | log it, redial with backoff |
 | `1001` | switchboard shutting down / restarting | redial with backoff |
 | `1000`, abnormal drop, timeout | network blip | redial with backoff |
 

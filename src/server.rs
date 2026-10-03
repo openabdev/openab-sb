@@ -3,8 +3,9 @@
 //! ```text
 //!   POST /mcp        northbound MCP (Streamable HTTP, JSON responses)  Bearer <client token>
 //!   GET  /vm/attach  southbound WebSocket, the VM dials in            Bearer <VM secret>
-//!   GET  /healthz    200 when the VM is attached and initialised, else 503 (no auth)
-//!   GET  /livez      200 while the process runs (no auth)
+//!   GET  /healthz    200 while the switchboard runs (no auth). Connect probes this
+//!                    before calling `sys_info`, so it must not depend on the VM
+//!   GET  /readyz     200 when the VM is attached and initialised, else 503 (no auth)
 //!   GET  /status     switchboard + VM state as JSON                   Bearer <client token>
 //! ```
 
@@ -38,7 +39,11 @@ pub struct App {
 
 impl App {
     pub fn new(config: &Config, audit: Audit) -> Self {
-        let hub = Hub::new(config.max_inflight, audit.clone());
+        let hub = Hub::new(
+            config.max_inflight,
+            config.auth.vm_secret.clone(),
+            audit.clone(),
+        );
         Self {
             mcp: Mcp {
                 hub,
@@ -63,8 +68,8 @@ impl App {
                     .delete(mcp_method_not_allowed),
             )
             .route("/vm/attach", get(vm_attach))
-            .route("/healthz", get(healthz))
-            .route("/livez", get(|| async { "ok" }))
+            .route("/healthz", get(|| async { "ok" }))
+            .route("/readyz", get(readyz))
             .route("/status", get(status))
             .layer(DefaultBodyLimit::max(MAX_MCP_BODY_BYTES))
             .with_state(self.clone())
@@ -76,7 +81,7 @@ impl App {
     pub fn reload_auth(&self, auth: Auth) {
         let vm_secret = auth.vm_secret.clone();
         *self.auth.write() = auth;
-        self.mcp.hub.revoke_unless(&vm_secret);
+        self.mcp.hub.set_vm_secret(vm_secret);
         self.audit.event("config_reloaded", json!({}));
     }
 
@@ -91,15 +96,26 @@ impl App {
     }
 }
 
-/// Peer for audit lines. A forwarded-for header is recorded next to the socket
-/// address but never trusted for anything.
+/// Longest forwarded-identity header copied into an audit line.
+const MAX_PEER_HEADER_CHARS: usize = 128;
+
+/// Peer for audit lines. A forwarded-identity header (set by `tailscale serve`
+/// or a tunnel) is recorded next to the socket address, truncated, and never
+/// trusted for anything: a direct caller can send any value.
 fn peer_label(addr: SocketAddr, headers: &HeaderMap) -> String {
     let forwarded = headers
         .get("tailscale-user-login")
         .or_else(|| headers.get("x-forwarded-for"))
         .and_then(|v| v.to_str().ok());
     match forwarded {
-        Some(f) => format!("{f} via {addr}"),
+        Some(f) => {
+            let f: String = f
+                .chars()
+                .filter(|c| !c.is_control())
+                .take(MAX_PEER_HEADER_CHARS)
+                .collect();
+            format!("{f} via {addr}")
+        }
         None => addr.to_string(),
     }
 }
@@ -134,7 +150,7 @@ async fn post_mcp(
             .map(|client| client.principal.clone())
     };
     let Some(principal) = principal else {
-        app.audit.event(
+        app.audit.auth_failure(
             "client_auth_fail",
             json!({ "peer": peer_label(addr, &headers) }),
         );
@@ -178,7 +194,7 @@ async fn mcp_method_not_allowed() -> Response {
         .into_response()
 }
 
-async fn healthz(State(app): State<App>) -> Response {
+async fn readyz(State(app): State<App>) -> Response {
     if app.mcp.hub.is_ready() {
         (StatusCode::OK, "ok").into_response()
     } else {
@@ -216,7 +232,8 @@ async fn vm_attach(
             .is_some_and(|p| auth.vm_secret.matches(p))
     };
     let (true, Some(secret)) = (verified, presented) else {
-        app.audit.event("vm_auth_fail", json!({ "peer": peer }));
+        app.audit
+            .auth_failure("vm_auth_fail", json!({ "peer": peer }));
         return unauthorized();
     };
     let hub = app.mcp.hub.clone();

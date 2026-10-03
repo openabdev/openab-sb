@@ -16,6 +16,8 @@ use std::time::Instant;
 
 /// Tool the switchboard answers itself, attached or not.
 pub const STATUS_TOOL: &str = "vm_status";
+/// Longest tool name accepted; names land in audit lines.
+pub const MAX_TOOL_NAME_CHARS: usize = 128;
 
 #[derive(Clone)]
 pub struct Mcp {
@@ -37,9 +39,14 @@ impl Mcp {
         let id = object.get("id").cloned();
         let method = object.get("method").and_then(Value::as_str);
         let (Some(id), Some(method)) = (id, method) else {
+            // A response a client sends us (it has `result`/`error`) is accepted
+            // like a notification; nothing here ever asked it anything.
+            let is_response = object.contains_key("result") || object.contains_key("error");
             return match (object.get("id"), method) {
-                (Some(id), None) => Some(rpc_error(id.clone(), -32600, "missing method")),
-                _ => None, // notification
+                (Some(id), None) if !is_response => {
+                    Some(rpc_error(id.clone(), -32600, "missing method"))
+                }
+                _ => None,
             };
         };
         let method = method.to_owned();
@@ -65,7 +72,7 @@ impl Mcp {
             "2025-06-18" | "2025-03-26" => offered,
             _ => MCP_PROTOCOL_VERSION,
         };
-        let instructions = if self.hub.is_attached() {
+        let instructions = if self.hub.is_ready() {
             "A remote VM is connected through OpenAB Switchboard. Its tools are listed under tools/list alongside vm_status. Calls are relayed over the network: expect latency of a second or more, and never assume a timed-out call did not run."
         } else {
             "The remote VM is not connected right now. Only vm_status is available; call it, or tools/list again later."
@@ -102,6 +109,12 @@ impl Mcp {
             Err(CallError::NotAttached) => return only_status(),
             Err(error) => return rpc_error(id, error.rpc_code(), error.message()),
         };
+        if let Some(error) = response.get("error") {
+            // Not an error to the caller: an MCP client may drop a server whose
+            // tools/list fails. `vm_status` stays callable to explain.
+            tracing::warn!(%error, "VM answered tools/list with an error");
+            return only_status();
+        }
         let Some(tools) = response
             .get_mut("result")
             .and_then(|r| r.get_mut("tools"))
@@ -131,14 +144,12 @@ impl Mcp {
         else {
             return rpc_error(id, -32602, "tools/call needs params.name");
         };
+        if name.is_empty() || name.chars().count() > MAX_TOOL_NAME_CHARS {
+            return rpc_error(id, -32602, "params.name must be 1-128 characters");
+        }
         let arguments = params.and_then(|p| p.get("arguments"));
         if arguments.is_some_and(|a| !a.is_object()) {
             return rpc_error(id, -32602, "params.arguments must be an object");
-        }
-
-        if name == STATUS_TOOL {
-            let status = self.hub.status();
-            return tool_result(id, status.to_string(), Some(status), false);
         }
 
         let started = Instant::now();
@@ -157,6 +168,12 @@ impl Mcp {
                 }),
             );
         };
+
+        if name == STATUS_TOOL {
+            let status = self.hub.status();
+            record("ok", None, 0);
+            return tool_result(id, status.to_string(), Some(status), false);
+        }
 
         if !who.tools.allows(&name) {
             record("denied", None, 0);
