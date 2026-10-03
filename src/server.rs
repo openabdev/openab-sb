@@ -79,9 +79,11 @@ impl App {
     /// configured is closed with `4003`; northbound tokens apply from the next
     /// request.
     pub fn reload_auth(&self, auth: Auth) {
-        let vm_secret = auth.vm_secret.clone();
+        // Hub first: an upgrade that passes the new check below must find the
+        // new verifier at install, not be refused with 4003 (which tells the
+        // daemon to stop).
+        self.mcp.hub.set_vm_secret(auth.vm_secret.clone());
         *self.auth.write() = auth;
-        self.mcp.hub.set_vm_secret(vm_secret);
         self.audit.event("config_reloaded", json!({}));
     }
 

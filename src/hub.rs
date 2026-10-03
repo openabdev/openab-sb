@@ -38,6 +38,9 @@ pub mod close_code {
     pub const REVOKED: u16 = 4003;
     /// The VM did not complete the MCP handshake; redial with backoff.
     pub const HANDSHAKE_FAILED: u16 = 4005;
+    /// Internal: the VM sent nothing for the whole liveness budget. Recorded in
+    /// the audit line; the socket is dead, so nothing reaches the peer.
+    pub const SILENT: u16 = 1011;
 }
 
 pub fn close_reason(code: u16) -> &'static str {
@@ -47,6 +50,7 @@ pub fn close_reason(code: u16) -> &'static str {
         close_code::TAKEOVER => "replaced by a newer attach",
         close_code::REVOKED => "VM secret revoked or rotated",
         close_code::HANDSHAKE_FAILED => "MCP initialize failed or timed out",
+        close_code::SILENT => "no frame from the VM within the liveness budget",
         _ => "closed",
     }
 }
@@ -439,6 +443,8 @@ impl Hub {
                     tracing::warn!(peer = %handshake.peer, ?response, "VM refused initialize");
                     handshake.close(close_code::HANDSHAKE_FAILED);
                 }
+                // Already closed (takeover, drop, revoke): not a handshake fault.
+                Err(_) if handshake.is_closed() => {}
                 Err(error) => {
                     tracing::warn!(peer = %handshake.peer, ?error, "MCP initialize toward the VM failed");
                     handshake.close(close_code::HANDSHAKE_FAILED);
@@ -470,6 +476,7 @@ impl Hub {
                     silent += 1;
                     if silent >= MAX_SILENT_INTERVALS {
                         tracing::info!(%peer, "VM silent past the ping budget");
+                        vm.close(close_code::SILENT);
                         break;
                     }
                     let _ = vm.to_vm.try_send(Message::Ping(Vec::new().into()));
