@@ -809,3 +809,33 @@ async fn pty_attach_redials_on_runtime_replaced_and_stops_on_other_4xxx() {
     assert!(again.is_err(), "redialled after 4003");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Answer one dial with a bare HTTP status, as a proxy in front of the pod does.
+async fn pod_refuse(pod: &tokio::net::TcpListener, status: &str) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let (mut tcp, _) = tokio::time::timeout(Duration::from_secs(5), pod.accept())
+        .await
+        .expect("switchboard did not dial the pod")
+        .unwrap();
+    let mut buf = [0u8; 4096];
+    let _ = tcp.read(&mut buf).await;
+    let reply = format!("HTTP/1.1 {status}\r\ncontent-length: 0\r\nconnection: close\r\n\r\n");
+    tcp.write_all(reply.as_bytes()).await.unwrap();
+    let _ = tcp.shutdown().await;
+}
+
+#[tokio::test]
+async fn pty_attach_redials_fast_after_a_proxy_error_but_slowly_after_401() {
+    let pod = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let (_sb, dir) = sb_dialling(pod.local_addr().unwrap(), "refuse").await;
+
+    // 502 from whatever fronts the pod: a path fault, so the normal 1 s/2 s
+    // backoff applies, not the one-minute grant poll.
+    pod_refuse(&pod, "502 Bad Gateway").await;
+    pod_refuse(&pod, "502 Bad Gateway").await;
+    // 401: only a fresh grant helps; nothing for the next several seconds.
+    pod_refuse(&pod, "401 Unauthorized").await;
+    let again = tokio::time::timeout(Duration::from_secs(6), pod.accept()).await;
+    assert!(again.is_err(), "polled fast after a 401");
+    let _ = std::fs::remove_dir_all(&dir);
+}

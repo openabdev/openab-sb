@@ -81,13 +81,20 @@ async fn run(mcp: Mcp, attach: PtyAttach, audit: Audit) {
             // 401 = no grant, wrong secret, or the pod was replaced. A human
             // re-mints and rewrites `secret_file`; poll slowly (the pod throttles
             // at five failed upgrades a minute).
-            Ended::Refused(status) => {
+            Ended::Refused(status) if is_credential_refusal(*status) => {
                 tracing::warn!(attach = %name, status, "openab-pty refused the attach; waiting for a fresh grant");
                 audit.event(
                     "pty_attach_refused",
                     json!({ "attach": name, "status": status }),
                 );
                 BACKOFF_MAX
+            }
+            // Any other status came from whatever fronts the pod (a 502 from
+            // `tailscale serve` while the pod restarts): a path fault, not a
+            // missing grant, so redial on the normal backoff.
+            Ended::Refused(status) => {
+                tracing::warn!(attach = %name, status, "openab-pty upgrade failed; redialling");
+                backoff
             }
             // Backoff caps at a minute, so warning each time stays bounded and a
             // wrong URL or a missing secret_file is visible at the default level.
@@ -203,6 +210,13 @@ fn is_stop_code(code: u16) -> bool {
     (4000..5000).contains(&code) && code != REDIAL_CODE
 }
 
+/// Upgrade refusals that only a fresh grant can fix: 401/403 (no grant, wrong
+/// or expired secret) and 429 (the pod's upgrade throttle). Polling these fast
+/// cannot help and keeps the throttle tripped.
+fn is_credential_refusal(status: u16) -> bool {
+    matches!(status, 401 | 403 | 429)
+}
+
 fn jitter(base: Duration) -> Duration {
     let mut raw = [0u8; 2];
     let spread = if getrandom::fill(&mut raw).is_ok() {
@@ -225,6 +239,18 @@ mod tests {
         }
         for code in [4006, 1000, 1001, 1006, 1011] {
             assert!(!is_stop_code(code), "{code}");
+        }
+    }
+
+    #[test]
+    fn only_credential_refusals_wait_for_a_fresh_grant() {
+        for status in [401, 403, 429] {
+            assert!(is_credential_refusal(status), "{status}");
+        }
+        // A proxy in front of the pod answering while it restarts is a path
+        // fault: normal backoff, not the one-minute grant poll.
+        for status in [400, 404, 500, 502, 503, 504] {
+            assert!(!is_credential_refusal(status), "{status}");
         }
     }
 }

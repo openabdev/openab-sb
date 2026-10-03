@@ -46,7 +46,7 @@ does not store anything.
 | state | memory only. A restart fails every in-flight call |
 | audit | JSON lines, file mode `0600`: attach, detach, takeover, auth failures (capped at 20 a minute, the rest summarised), and every `tools/call` with caller, tool, outcome, latency, size, and (optionally) arguments. Results are never logged |
 | reload | `SIGHUP` re-reads credentials. A VM attached with a rotated-out secret is closed with `4003`, including one whose upgrade was authenticated just before the reload |
-| PTY attach | redials with backoff on drops and on `4006` (pod replaced); stops on every other `4xxx`, per openab-pty §9.2. At most 64 requests from one pod are handled at once |
+| PTY attach | redials with backoff on drops, on `4006` (pod replaced) and on proxy errors such as `502`; a `401`/`403`/`429` refusal waits a minute for a fresh grant; stops on every other `4xxx`, per openab-pty §9.2. At most 64 requests from one pod are handled at once |
 
 ## Run
 
