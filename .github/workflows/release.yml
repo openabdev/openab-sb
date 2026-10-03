@@ -63,7 +63,7 @@ jobs:
           "$BIN" check -c smoke.toml
           rm smoke.toml
           if [[ "${{ matrix.asset }}" == linux-* ]]; then
-            file "$BIN" | tee /dev/stderr | grep -q 'statically linked'
+            file "$BIN" | tee /dev/stderr | grep -Eq 'statically linked|static-pie linked'
           fi
       - name: Package
         shell: bash
