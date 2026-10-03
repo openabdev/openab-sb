@@ -1,0 +1,104 @@
+name: release
+
+# Push a `vX.Y.Z` tag that matches Cargo.toml's version. Builds a static Linux
+# binary (musl) for amd64 and arm64 plus a macOS arm64 binary, then publishes
+# one GitHub Release with every tarball and a SHA256SUMS file.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: build (${{ matrix.asset }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - asset: linux-amd64
+            runner: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+          - asset: linux-arm64
+            runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+          - asset: darwin-arm64
+            runner: macos-14
+            target: aarch64-apple-darwin
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Tag matches Cargo.toml
+        shell: bash
+        run: |
+          set -euo pipefail
+          want="${GITHUB_REF_NAME#v}"
+          have=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          [ "$want" = "$have" ] || { echo "tag $GITHUB_REF_NAME but Cargo.toml says $have" >&2; exit 1; }
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - name: musl toolchain
+        if: startsWith(matrix.asset, 'linux')
+        run: sudo apt-get update -q && sudo apt-get install -y -q musl-tools
+      - name: Test
+        run: cargo test --release
+      - name: Build
+        run: cargo build --release --locked --target ${{ matrix.target }}
+      - name: Check the binary
+        shell: bash
+        run: |
+          set -euo pipefail
+          BIN=target/${{ matrix.target }}/release/openab-sb
+          "$BIN" --version
+          # The example with every placeholder replaced by a fresh verifier
+          # must validate: proves gen-secret and the config loader agree.
+          cp openab-sb.toml.example smoke.toml
+          while grep -q 'sha256:REPLACE_ME' smoke.toml; do
+            v=$("$BIN" gen-secret | awk '/verifier:/{print $2}')
+            awk -v v="$v" '!d && sub(/sha256:REPLACE_ME/, v) {d=1} 1' smoke.toml > smoke.tmp
+            mv smoke.tmp smoke.toml
+          done
+          "$BIN" check -c smoke.toml
+          rm smoke.toml
+          if [[ "${{ matrix.asset }}" == linux-* ]]; then
+            file "$BIN" | tee /dev/stderr | grep -q 'statically linked'
+          fi
+      - name: Package
+        shell: bash
+        run: |
+          set -euo pipefail
+          NAME="openab-sb-${GITHUB_REF_NAME#v}-${{ matrix.asset }}"
+          mkdir -p "$NAME/examples"
+          cp target/${{ matrix.target }}/release/openab-sb "$NAME/"
+          cp README.md LICENSE openab-sb.toml.example "$NAME/"
+          cp docs/SOUTHBOUND-CONTRACT.md "$NAME/"
+          cp examples/muse-daemon/sb_daemon.py "$NAME/examples/"
+          tar czf "$NAME.tar.gz" "$NAME"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: openab-sb-*.tar.gz
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Checksums
+        working-directory: dist
+        run: sha256sum openab-sb-*.tar.gz | tee SHA256SUMS
+      - name: Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" \
+            --title "openab-sb ${GITHUB_REF_NAME#v}" --generate-notes \
+            dist/openab-sb-*.tar.gz dist/SHA256SUMS

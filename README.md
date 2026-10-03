@@ -82,6 +82,18 @@ from whatever fronts the switchboard (`tailscale serve` or `cloudflared`; see Ru
 
 ## Run
 
+Releases ship a static Linux binary (amd64, arm64) and a macOS arm64 binary:
+
+```bash
+V=0.1.0; A=linux-amd64   # or linux-arm64, darwin-arm64
+curl -fsSLO https://github.com/openabdev/openab-sb/releases/download/v$V/openab-sb-$V-$A.tar.gz
+curl -fsSLO https://github.com/openabdev/openab-sb/releases/download/v$V/SHA256SUMS
+grep "$A" SHA256SUMS | shasum -a 256 -c -
+tar xzf openab-sb-$V-$A.tar.gz
+```
+
+Or build from source:
+
 ```bash
 cargo build --release
 ./target/release/openab-sb gen-secret            # once for the VM, once per client
