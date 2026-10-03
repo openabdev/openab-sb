@@ -1,2 +1,96 @@
-# openab-sb
-openab switchboard
+# openab-sb — OpenAB Switchboard
+
+Lets OpenAB Connect and agents in OpenAB PTY sessions call tools on a machine that
+**can only dial out** — a Meta Muse Secure VM, a box behind NAT, anything with no inbound
+port and no `tailscale serve`.
+
+The machine dials the switchboard over one WebSocket and serves MCP on it. The switchboard
+relays calls down that socket and sends the results back. It does not run tools and it
+does not store anything.
+
+```
+ OpenAB Connect ── MCP (HTTP + bearer) ──┐
+                                         ├─► openab-sb ◄── WS, dialled by the VM ── VM daemon
+ openab-pty pod ◄── WS /tools/attach ────┘    (switchboard)   plain MCP JSON-RPC      (MCP server)
+   (switchboard dials the pod, §9)
+```
+
+## How it fits
+
+- **Southbound (VM → switchboard):** the VM dials `GET /vm/attach` with a bearer secret.
+  The frames are plain MCP JSON-RPC, with no custom envelope, so any MCP server becomes a
+  switchboard backend by dialling out instead of listening. The contract for the daemon is
+  in [`docs/SOUTHBOUND-CONTRACT.md`](docs/SOUTHBOUND-CONTRACT.md), and a reference daemon is
+  in [`examples/muse-daemon/`](examples/muse-daemon/sb_daemon.py).
+- **Northbound for Connect:** add a computer in Connect with URL `https://<switchboard>/mcp`
+  and a client token. Connect calls `sys_info` and `screenshot`; `GET /healthz` reports
+  whether the VM is online.
+- **Northbound for PTY:** this needs no change to openab-pty. The switchboard plays the
+  "Mac" in openab-pty's tools plane (`CLIENT-CONTRACT.md` §9). It dials the pod's
+  `/tools/attach/{session}` and serves the VM's tools there, so the CLI in that session
+  reaches them through its usual `$OPENAB_TOOLS_MCP_URL`. An agent that can reach the
+  switchboard directly can also use `POST /mcp` with its own token.
+
+## Behaviour
+
+| | |
+|---|---|
+| VMs | one at a time. A newer attach replaces the older one (`4002`), and the older socket's cleanup never touches the newer one |
+| ids | rewritten per call, so callers sharing one socket cannot collide |
+| methods | `initialize` and `ping` are answered locally, `tools/list` is filtered, `tools/call` is policed. Everything else gets `-32601` and is not forwarded |
+| policy | a per-caller tool allowlist, checked before the request reaches the VM. `vm_status` is always available |
+| limits | `max_inflight` (default 8, extra calls are rejected); per-tool timeouts (`screenshot` 10 s, default 60 s); 16 MiB frames from the VM |
+| failures | `-32001` VM offline (returned as a tool error so clients keep the server), `-32002` overloaded, `-32003` timed out, `-32004` VM disconnected mid-call. Nothing is retried |
+| state | memory only. A restart fails every in-flight call |
+| audit | JSON lines: attach, detach, takeover, auth failures, and every `tools/call` with caller, tool, outcome, latency, size, and (optionally) arguments. Results are never logged |
+| reload | `SIGHUP` re-reads credentials. A VM attached with a rotated-out secret is closed with `4003` |
+
+## Run
+
+```bash
+cargo build --release
+./target/release/openab-sb gen-secret            # once for the VM, once per client
+cp openab-sb.toml.example openab-sb.toml        # paste the verifiers
+./target/release/openab-sb check -c openab-sb.toml
+./target/release/openab-sb serve -c openab-sb.toml
+```
+
+The switchboard binds loopback and refuses anything else unless you set
+`allow_insecure_bind = true`. Put TLS in front of it:
+
+- **The VM can reach your tailnet:** `tailscale serve --bg https / http://127.0.0.1:8790`.
+  Connect and the VM both use `https://<host>.<tailnet>.ts.net`.
+- **The VM can only reach the public internet:** expose it through a tunnel such as
+  `cloudflared`. The bearer tokens are then the only gate, so keep them long (the generated
+  ones are 256-bit) and rotate them with `SIGHUP`.
+
+Routes: `POST /mcp`, `GET /vm/attach`, `GET /healthz` (no auth), `GET /livez` (no auth),
+`GET /status` (client token).
+
+## Trust
+
+The switchboard holds credentials for both sides and can make the VM do anything its
+tools allow. Run it only on a machine you trust. It stores only `sha256:` verifiers, so its
+config file cannot be used to dial in or to call out.
+
+The allowlist is policy, not isolation. `key` and `mouse` can open a terminal, so a caller
+allowed those tools is effectively allowed a shell. The real boundary is that the VM itself
+can be thrown away.
+
+Tool output flows to callers unchanged. Screenshots and shell output from a VM that browses
+the web can carry prompt injection, so callers should treat that output as untrusted.
+
+## Not in v1
+
+More than one VM, load balancing, persistent queues or replay, storing results, and
+end-to-end encryption (TLS ends at whatever fronts the switchboard).
+
+## Develop
+
+```bash
+cargo test     # unit tests + e2e (fake VM, fake openab-pty pod, real sockets)
+cargo clippy --all-targets
+```
+
+The design came from a discussion with Muse:
+<https://muse-relay-arch.violet-coyote.workers.dev/>.
