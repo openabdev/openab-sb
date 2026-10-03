@@ -8,12 +8,44 @@ The machine dials the switchboard over one WebSocket and serves MCP on it. The s
 relays calls down that socket and sends the results back. It does not run tools and it
 does not store anything.
 
+```mermaid
+flowchart LR
+    subgraph callers["Callers"]
+        connect["OpenAB Connect<br/>(Mac app)"]
+        agent["Agent with<br/>its own token"]
+        subgraph pod["openab-pty pod"]
+            cli["Coding CLI<br/>in session S"]
+            rt["openab-pty runtime<br/>tools plane §9"]
+            cli -- "POST $OPENAB_TOOLS_MCP_URL" --> rt
+        end
+    end
+
+    subgraph sb["openab-sb (switchboard)"]
+        mcp["POST /mcp<br/>auth + per-caller allowlist"]
+        dialer["pty dialer<br/>one per pty_attach"]
+        hub["Hub<br/>one VM slot, id rewrite,<br/>timeouts, max_inflight"]
+        audit[("audit.jsonl")]
+        dialer --> mcp
+        mcp --> hub
+        hub -.-> audit
+    end
+
+    subgraph vm["Dial-out-only machine (Muse VM, NAT box)"]
+        daemon["sb_daemon<br/>MCP server"]
+        tools["sys_info, screenshot,<br/>mouse, key, bash"]
+        daemon --> tools
+    end
+
+    connect -- "HTTPS, Bearer client token" --> mcp
+    agent -- "HTTPS, Bearer client token" --> mcp
+    rt <== "WS /tools/attach/S<br/>dialled by openab-sb<br/>Bearer grant secret" ==> dialer
+    hub <== "WS /vm/attach<br/>dialled by the VM<br/>Bearer VM secret" ==> daemon
 ```
- OpenAB Connect ── MCP (HTTP + bearer) ──┐
-                                         ├─► openab-sb ◄── WS, dialled by the VM ── VM daemon
- openab-pty pod ◄── WS /tools/attach ────┘    (switchboard)   plain MCP JSON-RPC      (MCP server)
-   (switchboard dials the pod, §9)
-```
+
+Thick links are WebSockets, and each label says which side dials. Calls always flow from
+the callers toward the VM: the VM dials in and then serves MCP on its own socket, and the
+switchboard dials the pod and then answers the pod's requests on that socket. TLS comes
+from whatever fronts the switchboard (`tailscale serve` or `cloudflared`; see Run).
 
 ## How it fits
 
