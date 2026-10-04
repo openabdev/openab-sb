@@ -1,22 +1,25 @@
-//! Lend the VM to an openab-pty session, with no change to openab-pty.
+//! Lend one computer to an openab-pty session, with no change to openab-pty.
 //!
 //! openab-pty's tools plane (`CLIENT-CONTRACT.md` §9) expects the machine with
 //! the hands to dial `WS /tools/attach/{session}` and act as an MCP server on
 //! that socket. The switchboard plays that part: it dials the pod, answers the
 //! pod's MCP requests through the same [`Mcp`] surface Connect uses, under this
-//! attach's own allowlist. The coding CLI in the session then reaches the VM via
-//! its usual `$OPENAB_TOOLS_MCP_URL`.
+//! attach's own allowlist on the computer named in `[[pty_attach]].computer`.
+//! The coding CLI in the session then reaches that computer via its usual
+//! `$OPENAB_TOOLS_MCP_URL`.
 //!
 //! ```text
-//!   CLI ─► openab-pty ◄── WS /tools/attach/S ── openab-sb ◄── WS ── VM
+//!   CLI ─► openab-pty ◄── WS /tools/attach/S ── openab-sb ◄── WS ── computer
 //!          (MCP client)     we dial, Bearer      (MCP server)
 //! ```
 
 use crate::audit::Audit;
-use crate::config::PtyAttach;
+use crate::config::{Caller, PtyAttach};
 use crate::mcp::Mcp;
 use futures_util::{SinkExt, StreamExt};
+use parking_lot::RwLock;
 use serde_json::{json, Value};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, Semaphore};
@@ -51,17 +54,118 @@ enum Ended {
     Failed(String),
 }
 
-pub fn spawn(mcp: Mcp, attach: PtyAttach, audit: Audit) -> tokio::task::JoinHandle<()> {
-    let _ = rustls::crypto::ring::default_provider().install_default();
-    tokio::spawn(run(mcp, attach, audit))
+/// One running `[[pty_attach]]`: what it dials, and the policy it serves the
+/// pod with.
+///
+/// The policy is behind a lock and read **per request**, not once per process.
+/// A computer's name is a label the operator may change by `SIGHUP` (the
+/// verifier is the identity), and the slot is looked up by name on every call —
+/// so an attacher that cached its [`Caller`] would keep asking for a computer
+/// that no longer exists and answer the pod's CLI "the VM is not connected"
+/// for ever.
+pub struct Attacher {
+    /// The attach's name, which is what a reloaded block is matched by.
+    pub name: String,
+    /// Fixed for the life of the process: a live socket is dialled, so
+    /// repointing it needs a restart (ADR Reload).
+    url: String,
+    secret_file: PathBuf,
+    caller: RwLock<Caller>,
 }
 
-async fn run(mcp: Mcp, attach: PtyAttach, audit: Audit) {
-    let name = attach.principal.name.clone();
+impl Attacher {
+    fn new(attach: &PtyAttach) -> Option<Self> {
+        // The attach names exactly one computer (the loader enforces it), so
+        // `None` here is a config the loader should have refused.
+        let caller = attach.principal.resolve(None)?;
+        Some(Self {
+            name: attach.principal.name.clone(),
+            url: attach.url.clone(),
+            secret_file: attach.secret_file.clone(),
+            caller: RwLock::new(caller),
+        })
+    }
+
+    /// The policy for one request. A reload may swap it between two frames on
+    /// the same socket, which is the point.
+    fn caller(&self) -> Caller {
+        self.caller.read().clone()
+    }
+}
+
+/// Apply a reloaded `[[pty_attach]]` list to the attachers already running.
+///
+/// Names are unique across a config, so one block matches at most one
+/// attacher. What a reload can and cannot do, per the ADR's Reload table:
+///
+/// - `computer`, `tools`, `max_inflight` changed → swapped here, in force from
+///   that attach's next request. This is what keeps a same-verifier rename from
+///   cutting a pod off its computer.
+/// - `url` or `secret_file` changed, a block added, a block removed → the live
+///   socket is already dialled at the old URL with the old secret, so these
+///   still need a restart. Each one is reported at `warn`, because nothing else
+///   would show that the file on disk and the running attach disagree.
+pub fn relabel(attachers: &[Arc<Attacher>], fresh: &[PtyAttach]) {
+    for attacher in attachers {
+        let Some(block) = fresh.iter().find(|p| p.principal.name == attacher.name) else {
+            tracing::warn!(attach = %attacher.name,
+                               "[[pty_attach]] is gone from the config but still dialling under \
+                                its old policy; restart to stop it");
+            continue;
+        };
+        // The socket was dialled with the old url and secret, so those wait for a
+        // restart. The policy still follows the reload: skipping it would leave
+        // a renamed computer unreachable from this pod until then.
+        if block.url != attacher.url || block.secret_file != attacher.secret_file {
+            tracing::warn!(attach = %attacher.name,
+                           "[[pty_attach]] `url` or `secret_file` changed; the live attach keeps \
+                            dialling the old one until a restart (its computer and tools are \
+                            updated now)");
+        }
+        let Some(caller) = block.principal.resolve(None) else {
+            tracing::warn!(attach = %attacher.name,
+                           "reloaded [[pty_attach]] reaches no computer; keeping its old policy");
+            continue;
+        };
+        let mut live = attacher.caller.write();
+        if live.computer != caller.computer {
+            tracing::info!(attach = %attacher.name, from = %live.computer, to = %caller.computer,
+                           "[[pty_attach]] now lends another computer");
+        }
+        *live = caller;
+    }
+    for block in fresh {
+        if !attachers.iter().any(|a| a.name == block.principal.name) {
+            tracing::warn!(attach = %block.principal.name,
+                           "new [[pty_attach]] needs a restart before it is dialled");
+        }
+    }
+}
+
+/// Start dialling for one `[[pty_attach]]`. `None` means the block reaches no
+/// computer, which the loader should already have refused.
+pub fn spawn(
+    mcp: Mcp,
+    attach: PtyAttach,
+    audit: Audit,
+) -> Option<(Arc<Attacher>, tokio::task::JoinHandle<()>)> {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let Some(attacher) = Attacher::new(&attach) else {
+        tracing::error!(attach = %attach.principal.name,
+                        "pty attach reaches no computer; not dialling");
+        return None;
+    };
+    let attacher = Arc::new(attacher);
+    let handle = tokio::spawn(run(mcp, attacher.clone(), audit));
+    Some((attacher, handle))
+}
+
+async fn run(mcp: Mcp, attacher: Arc<Attacher>, audit: Audit) {
+    let name = attacher.name.clone();
     let mut backoff = BACKOFF_START;
     loop {
         let started = Instant::now();
-        let ended = dial_once(&mcp, &attach, &audit).await;
+        let ended = dial_once(&mcp, &attacher, &audit).await;
         let wait = match &ended {
             Ended::Closed(Some(code)) if is_stop_code(*code) => {
                 tracing::info!(attach = %name, code, "openab-pty ended the attach; not redialling");
@@ -108,13 +212,13 @@ async fn run(mcp: Mcp, attach: PtyAttach, audit: Audit) {
     }
 }
 
-async fn dial_once(mcp: &Mcp, attach: &PtyAttach, audit: &Audit) -> Ended {
+async fn dial_once(mcp: &Mcp, attacher: &Arc<Attacher>, audit: &Audit) -> Ended {
     // Re-read every dial so a rotated secret heals without a restart.
-    let secret = match std::fs::read_to_string(&attach.secret_file) {
+    let secret = match std::fs::read_to_string(&attacher.secret_file) {
         Ok(text) => text.trim().to_owned(),
-        Err(error) => return Ended::Failed(format!("{}: {error}", attach.secret_file.display())),
+        Err(error) => return Ended::Failed(format!("{}: {error}", attacher.secret_file.display())),
     };
-    let mut request = match attach.url.as_str().into_client_request() {
+    let mut request = match attacher.url.as_str().into_client_request() {
         Ok(request) => request,
         Err(error) => return Ended::Failed(error.to_string()),
     };
@@ -133,9 +237,13 @@ async fn dial_once(mcp: &Mcp, attach: &PtyAttach, audit: &Audit) -> Ended {
             Err(error) => return Ended::Failed(error.to_string()),
         };
 
-    let name = attach.principal.name.clone();
-    audit.event("pty_attach", json!({ "attach": name }));
-    tracing::info!(attach = %name, "lent the VM to an openab-pty session");
+    let name = attacher.name.clone();
+    // Only a label for the audit line: the policy this socket serves is read
+    // again for every request below.
+    let lent = attacher.caller().computer;
+    audit.event("pty_attach", json!({ "attach": name, "computer": lent }));
+    tracing::info!(attach = %name, computer = %lent,
+                   "lent a computer to an openab-pty session");
 
     let (mut sink, mut stream) = socket.split();
     let (out_tx, mut out_rx) = mpsc::channel::<Message>(64);
@@ -177,11 +285,13 @@ async fn dial_once(mcp: &Mcp, attach: &PtyAttach, audit: &Audit) -> Ended {
                         continue;
                     };
                     let mcp = mcp.clone();
-                    let principal = attach.principal.clone();
+                    // Per request, not per socket: a SIGHUP between two frames
+                    // moves this call onto the computer the config now names.
+                    let caller = attacher.caller();
                     let out = out_tx.clone();
                     tokio::spawn(async move {
                         let _permit = permit;
-                        if let Some(response) = mcp.handle(&principal, request).await {
+                        if let Some(response) = mcp.handle(&caller, request).await {
                             let _ = out.send(Message::Text(response.to_string().into())).await;
                         }
                     });
@@ -201,7 +311,8 @@ async fn dial_once(mcp: &Mcp, attach: &PtyAttach, audit: &Audit) -> Ended {
     writer.abort();
     audit.event(
         "pty_detach",
-        json!({ "attach": name, "code": match &ended { Ended::Closed(c) => *c, _ => None } }),
+        json!({ "attach": name, "computer": attacher.caller().computer,
+                "code": match &ended { Ended::Closed(c) => *c, _ => None } }),
     );
     ended
 }
@@ -231,6 +342,89 @@ fn jitter(base: Duration) -> Duration {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::auth::Verifier;
+    use crate::config::Config;
+
+    /// One `[[pty_attach]]` block as the loader produces it. Two computers are
+    /// configured so that `computer` is meaningful and must be written out.
+    fn block(computer: &str, url: &str, tools: &str) -> PtyAttach {
+        let text = format!(
+            r#"
+[[computer]]
+name = "m1"
+secret_sha256 = "{a}"
+
+[[computer]]
+name = "macmini"
+secret_sha256 = "{b}"
+
+[[pty_attach]]
+name = "kiro-1040"
+computer = "{computer}"
+url = "{url}"
+secret_file = "/tmp/openab-sb-relabel-test.secret"
+tools = {tools}
+"#,
+            a = Verifier::of_secret("secret-a").render(),
+            b = Verifier::of_secret("secret-b").render(),
+        );
+        let mut parsed = Config::parse(&text).expect("test config");
+        parsed.pty_attach.remove(0)
+    }
+
+    const URL: &str = "ws://127.0.0.1:9100/tools/attach/laptop";
+
+    fn running(attach: &PtyAttach) -> Vec<Arc<Attacher>> {
+        vec![Arc::new(Attacher::new(attach).expect("resolves"))]
+    }
+
+    /// Renaming a computer by `SIGHUP` keeps its verifier and its socket, so
+    /// the attach lending it must follow the label.
+    #[test]
+    fn a_reload_points_a_running_attach_at_the_renamed_computer() {
+        let live = running(&block("m1", URL, r#"["*"]"#));
+        assert_eq!(live[0].caller().computer, "m1");
+        relabel(&live, &[block("macmini", URL, r#"["*"]"#)]);
+        assert_eq!(live[0].caller().computer, "macmini");
+    }
+
+    #[test]
+    fn a_reload_swaps_the_allowlist_and_the_per_caller_cap_too() {
+        let live = running(&block("m1", URL, r#"["*"]"#));
+        assert!(live[0].caller().tools.allows("bash"));
+        relabel(&live, &[block("m1", URL, r#"["sys_info"]"#)]);
+        let caller = live[0].caller();
+        assert!(caller.tools.allows("sys_info"));
+        assert!(!caller.tools.allows("bash"));
+    }
+
+    /// `url` and `secret_file` belong to the socket that is already dialled, so
+    /// they wait for a restart. The policy (computer and tools) is not tied to
+    /// the socket and still follows the reload: otherwise a computer renamed in
+    /// the same edit would leave this pod asking for a name that no longer exists.
+    #[test]
+    fn a_changed_url_still_takes_the_new_policy() {
+        let live = running(&block("m1", URL, r#"["*"]"#));
+        relabel(
+            &live,
+            &[block(
+                "macmini",
+                "ws://127.0.0.1:9101/tools/attach/laptop",
+                r#"["sys_info"]"#,
+            )],
+        );
+        let caller = live[0].caller();
+        assert_eq!(caller.computer, "macmini");
+        assert!(!caller.tools.allows("bash"));
+        assert_eq!(live[0].url, URL, "the dial target is not swapped live");
+    }
+
+    #[test]
+    fn a_block_that_is_gone_leaves_its_running_attach_as_it_was() {
+        let live = running(&block("m1", URL, r#"["*"]"#));
+        relabel(&live, &[]);
+        assert_eq!(live[0].caller().computer, "m1");
+    }
 
     #[test]
     fn stops_on_every_4xxx_except_runtime_replaced() {
