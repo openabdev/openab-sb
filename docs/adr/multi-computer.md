@@ -334,7 +334,7 @@ behave as before while there is one computer.
    - `/readyz` bodies carry no names or counts;
    - unknown and not-allowed give identical responses on every route;
    - a `"*"` caller's `/mcp` `tools/list` is identical before and after a computer is added;
-   - `/readyz` is unchanged with one computer and gives `ready N/M` with several;
+   - `/readyz` is unchanged with one computer, and with several is 200 when any is ready;
    - `peer` is hidden from non-`"*"` callers.
 4. **`[[pty_attach]].computer`.**
 5. **Deploy on macmini.** Swapping the binary is a restart: instance-mcp gets `1001` and
