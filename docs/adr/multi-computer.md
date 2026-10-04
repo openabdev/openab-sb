@@ -1,6 +1,6 @@
 # ADR: one switchboard, many computers (v2)
 
-Status: proposed · 2026-10-03 · revision 2 (after review) · supersedes the "one VM at a time"
+Status: proposed · 2026-10-03 · revision 3 (after two reviews) · supersedes the "one VM at a time"
 rule of v1
 
 ## Context
@@ -67,6 +67,16 @@ Config rules, all enforced by `check` and at load:
   between the VM secret and a client token (`config.rs:244,248`); v2 extends that to every
   pair.
 - `[vm]` and `[[computer]]` in the same file is an error.
+- Every computer named anywhere must exist: in `default_computer`, in a client's
+  `computers` table, or in `[[pty_attach]].computer`. `default_computer` must also be one
+  the caller may reach. Otherwise the config is refused. Without this, a typo such as
+  `macmni` would grant nothing today and **pre-grant** access to any computer given that
+  name later. A consequence: removing a computer fails the reload, keeping the old config
+  (`main.rs:134`), until every block naming it is edited in the same change.
+- Computer names are a separate namespace from client and pty-attach names, which stay
+  unique among themselves as in v1 (`config.rs:240,263`). Audit lines carry `principal` and
+  `computer` as distinct fields, so `macmini` as both a computer and a client name is
+  unambiguous.
 
 ### Callers get access per computer, deny by default
 
@@ -107,7 +117,7 @@ computers = { macmini = ["sys_info", "screenshot"], muse-vm = ["sys_info"] }
 - A client still carrying v1's top-level `tools` alongside `[[computer]]` blocks is an
   error. That combination means a half-migrated config, and guessing which computer it
   meant would be wrong.
-- `check` warns about any computer that no caller may use.
+- `check` warns about any computer that no client or pty attach may use.
 
 ### Northbound: one MCP endpoint per computer
 
@@ -116,6 +126,10 @@ POST /mcp/{computer}     MCP for one computer; tool names unchanged
 POST /mcp                exactly /mcp/{default_computer}
 GET  /computers          JSON: the computers this caller may use, and whether each is online
 ```
+
+`GET /computers` returns `[{ "name", "default": bool, "attached": bool, "ready": bool }]`,
+one entry per computer the caller may use. The `"*"`-only fields of `/status` are not
+included.
 
 **`/mcp` never changes meaning when a computer is added.** It is always the caller's
 `default_computer`:
@@ -172,17 +186,22 @@ Without `computer` and with more than one computer configured, the config is ref
 - `GET /readyz` takes no auth and reveals no names:
   - With **one computer** it behaves exactly as in v1: 200 when that computer is attached
     and ready, else 503.
-  - With **several**, it returns 200 if any computer is ready, else 503. The body is only
-    `ready N/M`. An intermittent computer such as a Muse VM does not make it flap.
+  - With **several**, it returns 200 if any computer is ready, else 503. The bodies are
+    v1's (`ok` / `vm offline`), with no counts, so an unauthenticated probe learns neither
+    names nor how many computers exist. An intermittent computer such as a Muse VM does not
+    make it flap.
 - `GET /readyz/{computer}` **requires a client token** and answers only for that caller's
   computers: 200 ready, 503 offline. Unknown and not-allowed give the same 404 as on
   `/mcp/{computer}`, so a tailnet node without a token (an untagged Muse node included)
   cannot learn which computers exist. Monitoring uses a token scoped to the computers it
-  watches.
+  watches, for example `computers = { macmini = ["vm_status"] }` (a tool list may not be
+  empty, `config.rs:87-89`).
 - `GET /status` (client token) lists only the caller's computers.
   - The socket peer (`hub.rs:243-252`, taken from forwarded identity headers,
     `server.rs:104-123`) and the in-flight count are shown only to `"*"` callers.
-  - Other callers see each computer's name, `attached`, `ready` and `server`.
+  - Other callers see each computer's name, `attached`, `ready`, `server`,
+    `attached_for_secs` and `max_in_flight` (`hub.rs:243-252`). Only `peer` and `in_flight`
+    are hidden.
   - The same filter applies to the `vm_status` tool.
 
 ### Hub: a map of slots under one lock
@@ -191,7 +210,7 @@ Without `computer` and with more than one computer configured, the config is ref
   per-slot locks, so install, takeover and reload never interleave across computers.
 - `/vm/attach` compares the presented verifier against **every** computer verifier with no
   early exit, the same way v1 handles client tokens (`config.rs:163-173`). Timing does not
-  reveal which computer, or how many there are.
+  reveal which computer matched.
 - **Install re-resolves under the lock.** v1's protection against an attach authenticated
   just before a reload (`hub.rs:341-346`) generalises as follows: at install, the socket's
   verifier is looked up again in the current table; if it is gone, the socket is refused
@@ -209,8 +228,13 @@ screenshot poll on macmini.
 
 v2 adds a per-client cap on each computer:
 
-- `[[client]].max_inflight` sets it.
-- The default is half of that computer's `max_inflight`, rounded up.
+- The cap applies to **every principal**, clients and pty attaches alike. A pod attach is a
+  caller too, and its own 64-request ceiling (`pty.rs`, `MAX_CONCURRENT_POD_REQUESTS`) is
+  larger than any computer's cap, so without this one pod could starve Connect.
+- `[[client]].max_inflight` and `[[pty_attach]].max_inflight` set it, within `1..=64`.
+- The default is half of the **live socket's** `max_inflight` (the value it attached with,
+  `hub.rs:352`), rounded up. A reload that changes the computer's limit does not move the
+  per-caller default until the next attach.
 - A caller over its cap gets `-32002` without the call being sent, exactly like the
   computer-wide cap.
 
@@ -223,8 +247,9 @@ v2 adds a per-client cap on each computer:
 | Computer removed, or its verifier rotated | that socket closes with `4003`. Its in-flight calls fail with `-32004` and **may have run** (`hub.rs:151-158`). Other computers are untouched |
 | Same verifier, new name | the live socket is relabelled, and an audit line `computer_renamed` records it. No close |
 | A verifier moved from one name to another | a relabel, not a revoke |
-| `max_inflight` (global or per computer) | applies to the next attach of that computer. A live socket keeps the value it attached with (`hub.rs:352`) |
+| `max_inflight` (global or per computer) | **new in v2**: reloaded, and applied to that computer's next attach. A live socket keeps the value it attached with (`hub.rs:352`). In v1 limits need a restart (`main.rs:130`) |
 | `[[pty_attach]]` added, removed or changed, `listen`, timeouts | need a restart, as in v1 (`server.rs:90-99`, `main.rs:130`) |
+| Per-caller `max_inflight` | from that caller's next call |
 
 Reload stays hub-first, as v1's `reload_auth` does (`server.rs:81-90`). The computer table
 is swapped before client auth, so a daemon presenting a newly added secret is never
@@ -290,6 +315,9 @@ behave as before while there is one computer.
    - a multi-computer or `"*"` caller without `default_computer` is refused;
    - a client keeping `tools` beside `[[computer]]` is refused;
    - `[[pty_attach]]` without `computer` is refused when there are several computers;
+   - a computer name in `default_computer`, `computers` or `[[pty_attach]].computer` that is
+     not configured is refused, and a `default_computer` the caller may not reach is refused;
+   - a per-caller `max_inflight` outside `1..=64` is refused;
    - `check` warns about a computer no caller may use.
 2. **The hub as a map.** End-to-end tests:
    - two fake computers stay attached together;
@@ -298,17 +326,20 @@ behave as before while there is one computer.
    - swapping two verifiers between names evicts nothing;
    - an attach authenticated just before its verifier is removed is refused with `4003`;
    - per-computer in-flight isolation: one computer full, the other still answers;
-   - the per-client cap leaves room for a second caller on the same computer.
+   - the per-caller cap leaves room for a second caller on the same computer, and applies to
+     a pty attach as well as a client;
 3. **Routes.** End-to-end tests:
    - `/mcp/{computer}`, `/computers` and `/readyz/{computer}` work for allowed computers;
-   - `/mcp/{unknown}` without a token is `401`;
+   - `/mcp/{unknown}` and `/readyz/{unknown}` without a token are `401`;
+   - `/readyz` bodies carry no names or counts;
    - unknown and not-allowed give identical responses on every route;
    - a `"*"` caller's `/mcp` `tools/list` is identical before and after a computer is added;
    - `/readyz` is unchanged with one computer and gives `ready N/M` with several;
    - `peer` is hidden from non-`"*"` callers.
 4. **`[[pty_attach]].computer`.**
-5. **Deploy on macmini**: relabel `default` to `macmini` by reload, and confirm instance-mcp
-   stays attached throughout.
+5. **Deploy on macmini.** Swapping the binary is a restart: instance-mcp gets `1001` and
+   redials (`ReverseAttachClient.swift:126`). After that, relabel `default` to `macmini` by
+   reload and confirm instance-mcp stays attached through the reload.
 6. **First second computer: Muse's VM.** Open questions for Muse before this step:
    - Can a WebSocket upgrade cross its TCP-only `:3130` HTTP proxy? That needs `CONNECT`, and
      proxy support in the daemon's WebSocket library.
