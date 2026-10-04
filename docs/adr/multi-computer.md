@@ -1,6 +1,7 @@
 # ADR: one switchboard, many computers (v2)
 
-Status: proposed · 2026-10-03 · supersedes the "one VM at a time" rule of v1
+Status: proposed · 2026-10-03 · revision 2 (after review) · supersedes the "one VM at a time"
+rule of v1
 
 ## Context
 
@@ -11,10 +12,10 @@ broke the moment there were two computers:
 - macmini (instance-mcp 0.8.0, switchboard mode) holds the slot today. Muse's VM attaching
   as a second set of hands would evict it, and the macmini daemon would stop by contract.
 - Testing a second Mac's `wss://` path would do the same.
-- The only workaround is one switchboard per computer, with its own port, `tailscale serve`
-  entry, tokens and, for Muse, its own per-address approval.
+- The only workaround is one switchboard per computer, each with its own port,
+  `tailscale serve` entry and tokens, and for Muse its own per-address approval.
 
-The trust model the owner described is two layers, and v1 only has the first:
+The owner's trust model is two layers, and v1 only has the first:
 
 1. **Who may attach.** Callers are on the tailnet (the `tailscale serve` front) *and*
    present a bearer token. Computers present their own secret.
@@ -26,9 +27,11 @@ natural place for that list, since every computer already dials it.
 
 ## Decision
 
-### Computers are configured, named, and identified by their secret
+### Computers are configured; the verifier is the identity, the name is a label
 
 ```toml
+max_inflight = 8            # default for every computer (unchanged from v1)
+
 [[computer]]
 name = "macmini"
 secret_sha256 = "sha256:…"
@@ -36,29 +39,43 @@ secret_sha256 = "sha256:…"
 [[computer]]
 name = "muse-vm"
 secret_sha256 = "sha256:…"
-max_inflight = 4            # optional; per computer, default 8
+max_inflight = 4            # optional override
 ```
 
 - A computer still dials `GET /vm/attach` with `Authorization: Bearer <secret>`. **The
-  secret alone selects the slot**: verifiers must be unique across computers (`check`
-  refuses duplicates, as v1 already does for clients). No URL change, so every v1 daemon
-  (instance-mcp 0.8.0, `sb_daemon.py`) works unchanged.
-- A name the computer reports about itself (`serverInfo`, hostname) is shown in status and
-  never trusted. The configured name is the identity.
+  secret alone selects the slot.** The URL does not change, so every v1 daemon
+  (instance-mcp 0.8.0, `sb_daemon.py`) works as is.
+- **Slot identity is the verifier.** The configured name is the label used in policy,
+  routes and audit. A reload that keeps a verifier and changes its name relabels the live
+  socket; nothing is closed (see Reload).
+- A name attests possession of a secret, not a particular machine. Whoever holds a
+  computer's secret answers as that computer, so a leaked secret is replaced, not tolerated.
+- Anything a computer reports about itself (`serverInfo`, hostname, forwarded headers) is
+  shown, never trusted.
 - No self-registration. Adding a computer is an operator action: generate a pair, add the
-  verifier, `SIGHUP`.
+  verifier, then `SIGHUP`.
 - One live socket per computer. A second attach **with the same secret** replaces the first
-  (`4002`, unchanged). An attach with another computer's secret takes *that* computer's slot
-  and touches nothing else.
-- Removing or rotating a computer's verifier on reload closes only that computer (`4003`).
+  (`4002`, unchanged). An attach with another computer's secret takes only *that*
+  computer's slot.
 
-### Callers get access per computer
+Config rules, all enforced by `check` and at load:
+
+- Computer names are 1–64 characters of `[A-Za-z0-9_-]`. **`.` is not allowed**, because a
+  bare TOML key `rpi1.local` is a dotted key that makes a nested table. v1 names (`.` allowed,
+  `config.rs:332`) keep their rule for clients and pty attaches.
+- Verifiers are unique across **all** computers and clients. v1 already refuses reuse
+  between the VM secret and a client token (`config.rs:244,248`); v2 extends that to every
+  pair.
+- `[vm]` and `[[computer]]` in the same file is an error.
+
+### Callers get access per computer, deny by default
 
 ```toml
 [[client]]
 name = "pahud"
 token_sha256 = "sha256:…"
-computers = { "*" = ["*"] }                     # owner: every computer, every tool
+default_computer = "macmini"                  # required: more than one computer reachable
+computers = { "*" = ["*"] }                   # owner: every computer, every tool
 
 [[client]]
 name = "muse"
@@ -66,45 +83,74 @@ token_sha256 = "sha256:…"
 computers = { macmini = ["sys_info", "screenshot", "browser_navigate", "browser_snapshot",
                          "browser_click", "browser_type", "browser_press_key",
                          "browser_wait_for", "browser_tabs", "browser_take_screenshot"] }
+max_inflight = 4                              # optional, see Fairness
 
 [[client]]
 name = "connect"
 token_sha256 = "sha256:…"
+default_computer = "macmini"
 computers = { macmini = ["sys_info", "screenshot"], muse-vm = ["sys_info"] }
 ```
 
-- **Deny by default.** A computer missing from `computers` does not exist for that caller:
-  it is not listed, and calling it is the same error as calling an unknown computer. No
-  enumeration through error differences.
-- `"*"` as a computer name means every configured computer. It is meant for the owner and
-  is logged at startup when used.
-- The tool list per computer is the same allowlist v1 has, including `vm_status` always
-  being available. It is still policy, not isolation (see Trust in the README); the
-  computer's own profile (instance-mcp `observe`/`desktop`/`owner`) remains the ceiling, and
-  the caller gets the intersection.
+- **Deny by default.** A computer missing from `computers` does not exist for that caller,
+  on every route. "Not allowed" and "unknown" produce byte-identical responses.
+- **`"*"` means every computer, including ones added later.** A `"*"` caller gains access
+  to a new computer the moment it is configured, with no change to its own block. It is for
+  the owner, and startup logs every client that uses it.
+- `"*"` may not be mixed with named computers in one `computers` table, just as v1 refuses
+  `"*"` mixed with tool names (`config.rs:89-94`).
+- `computers` may not be empty, and each tool list follows the v1 allowlist rules, including
+  that `vm_status` is always available.
+- The tool list is still policy, not isolation (see Trust in the README). The computer's own
+  profile (instance-mcp `observe`/`desktop`/`owner`) remains the ceiling, and the caller
+  gets the intersection.
+- A client still carrying v1's top-level `tools` alongside `[[computer]]` blocks is an
+  error. That combination means a half-migrated config, and guessing which computer it
+  meant would be wrong.
+- `check` warns about any computer that no caller may use.
 
 ### Northbound: one MCP endpoint per computer
 
 ```
-POST /mcp/{computer}     MCP for one computer, tool names unchanged
-POST /mcp                the caller's only computer, if it has exactly one; otherwise an
-                         `initialize` instruction listing /mcp/{computer} and a tools/list
-                         with only `list_computers`
-GET  /computers          JSON: the computers this caller may use, with online state
+POST /mcp/{computer}     MCP for one computer; tool names unchanged
+POST /mcp                exactly /mcp/{default_computer}
+GET  /computers          JSON: the computers this caller may use, and whether each is online
 ```
 
-Why a path per computer instead of namespaced tools (`macmini__screenshot`) or a
+**`/mcp` never changes meaning when a computer is added.** It is always the caller's
+`default_computer`:
+
+- If a caller can reach exactly one computer, that computer is its default and the field
+  is optional.
+- If it can reach more than one (including any `"*"` caller), `default_computer` is
+  required and `check` refuses the config without it.
+
+Adding `muse-vm` therefore leaves `pahud`'s `/mcp` pointing at macmini, and Connect or Kiro
+configured on `/mcp` keep working.
+
+Order of checks on every northbound request:
+
+1. The bearer token is checked **before the path is resolved**. A missing or wrong token is
+   `401` whatever the path says, so `/mcp/{unknown}` without a token tells nothing.
+2. The computer is resolved against the caller's allowlist. Not allowed and unknown give
+   the same `404` with the same body.
+3. Tool policy and forwarding work as in v1.
+
+Why a path per computer rather than namespaced tool names (`macmini__screenshot`) or a
 `computer` argument on every tool:
 
-- **Tool names stay exact.** Connect matches `sys_info` and `screenshot` by name; models are
-  prompted with instance-mcp's own instructions, which name tools unprefixed.
-- **A computer is an MCP server.** MCP clients already know how to hold several servers.
-  Adding "macmini" and "muse-vm" as two servers in Kiro, Connect or a Muse skill is the
-  existing UX, with the switchboard as the only URL host.
+- **Tool names stay exact.** Connect matches `sys_info` and `screenshot` by name, and models
+  are prompted with instance-mcp's instructions, which name tools unprefixed.
+- **A computer is an MCP server.** MCP clients already hold several servers. Adding
+  "macmini" and "muse-vm" as two servers in Kiro, Connect or a Muse skill is the existing UX.
 - **Policy is evaluated once per request** from the path, before any frame is sent.
 
-`/mcp` keeps v1 behaviour for callers with exactly one computer, so existing clients do not
-change. `GET /computers` is what a node picker (instance-mcp #27, Connect) reads.
+There is no `list_computers` MCP tool. Pickers (#27, Connect) are HTTP clients and read
+`GET /computers`, and a model on `/mcp/{computer}` could not act on such a list anyway.
+
+`initialize` names the computer in its instructions ("…connected through OpenAB Switchboard
+as `macmini`…"). The always-available tool keeps the name `vm_status` for compatibility and
+gains a `computer` field.
 
 ### PTY attach names its computer
 
@@ -118,44 +164,103 @@ tools = ["*"]
 ```
 
 This is the switchboard half of #27: "lend muse-vm to session `laptop`" is one block.
+Without `computer` and with more than one computer configured, the config is refused.
 
-### Health, status, audit
+### Health and status
 
-- `/healthz` is unchanged (switchboard alive).
-- `/readyz` is 200 when **every** configured computer is ready; `/readyz/{computer}` is the
-  per-computer probe. Monitoring can alert on either.
-- `/status` (client token) lists only the computers that caller may use.
-- Every audit line about a call or an attach gains `computer`. Takeover and revoke lines are
-  per computer.
+- `GET /healthz` is unchanged: no auth, the switchboard is alive.
+- `GET /readyz` takes no auth and reveals no names:
+  - With **one computer** it behaves exactly as in v1: 200 when that computer is attached
+    and ready, else 503.
+  - With **several**, it returns 200 if any computer is ready, else 503. The body is only
+    `ready N/M`. An intermittent computer such as a Muse VM does not make it flap.
+- `GET /readyz/{computer}` **requires a client token** and answers only for that caller's
+  computers: 200 ready, 503 offline. Unknown and not-allowed give the same 404 as on
+  `/mcp/{computer}`, so a tailnet node without a token (an untagged Muse node included)
+  cannot learn which computers exist. Monitoring uses a token scoped to the computers it
+  watches.
+- `GET /status` (client token) lists only the caller's computers.
+  - The socket peer (`hub.rs:243-252`, taken from forwarded identity headers,
+    `server.rs:104-123`) and the in-flight count are shown only to `"*"` callers.
+  - Other callers see each computer's name, `attached`, `ready` and `server`.
+  - The same filter applies to the `vm_status` tool.
+
+### Hub: a map of slots under one lock
+
+- The hub holds one `Mutex` over the whole table: verifier → (name, slot). There are no
+  per-slot locks, so install, takeover and reload never interleave across computers.
+- `/vm/attach` compares the presented verifier against **every** computer verifier with no
+  early exit, the same way v1 handles client tokens (`config.rs:163-173`). Timing does not
+  reveal which computer, or how many there are.
+- **Install re-resolves under the lock.** v1's protection against an attach authenticated
+  just before a reload (`hub.rs:341-346`) generalises as follows: at install, the socket's
+  verifier is looked up again in the current table; if it is gone, the socket is refused
+  with `4003`, and if it now maps to another name, it installs under that name.
+- Each slot has its own pending table, `max_inflight`, ping liveness and close handling.
+  A slow or dead computer cannot starve another.
+- `generation` is per computer (v1's is hub-wide, `hub.rs:264`). Audit lines carry
+  `computer` and that computer's generation.
+
+### Fairness between callers on one computer
+
+`max_inflight` counts per socket (`hub.rs:174-180`). Without more, one caller can occupy
+every slot on a shared computer, so a long Muse browsing run would starve Connect's
+screenshot poll on macmini.
+
+v2 adds a per-client cap on each computer:
+
+- `[[client]].max_inflight` sets it.
+- The default is half of that computer's `max_inflight`, rounded up.
+- A caller over its cap gets `-32002` without the call being sent, exactly like the
+  computer-wide cap.
+
+### Reload (SIGHUP)
+
+| Change | Effect |
+|---|---|
+| Client added, removed, token rotated, allowlist or `default_computer` changed | from the next request |
+| Computer added | its slot exists at once and accepts an attach |
+| Computer removed, or its verifier rotated | that socket closes with `4003`. Its in-flight calls fail with `-32004` and **may have run** (`hub.rs:151-158`). Other computers are untouched |
+| Same verifier, new name | the live socket is relabelled, and an audit line `computer_renamed` records it. No close |
+| A verifier moved from one name to another | a relabel, not a revoke |
+| `max_inflight` (global or per computer) | applies to the next attach of that computer. A live socket keeps the value it attached with (`hub.rs:352`) |
+| `[[pty_attach]]` added, removed or changed, `listen`, timeouts | need a restart, as in v1 (`server.rs:90-99`, `main.rs:130`) |
+
+Reload stays hub-first, as v1's `reload_auth` does (`server.rs:81-90`). The computer table
+is swapped before client auth, so a daemon presenting a newly added secret is never
+refused with `4003`.
 
 ### Compatibility
 
 A v1 config loads unchanged:
 
 - `[vm]` becomes a computer named `default`.
-- A client's `tools = [...]` becomes `computers = { default = [...] }`.
+- A client's `tools = [...]` becomes `computers = { default = [...] }`, with
+  `default_computer = "default"`.
 - `[[pty_attach]]` without `computer` targets `default`.
+- Top-level `max_inflight` stays the per-computer default.
 
-Mixing `[vm]` with `[[computer]]` is a config error, so there is never a question of which
-one wins.
+Nothing a v1 caller or daemon sees changes: `/mcp`, `/readyz`, `/status` and the close codes
+behave as before while there is one computer.
 
 ## Consequences
 
 - One switchboard, one port, one `tailscale serve` entry and, for Muse, one approved address
   serve every computer.
-- macmini and a Muse VM can both be attached; neither evicts the other.
-- Muse as a caller keeps its token and adds one URL (`/mcp/macmini`). Muse as a computer
+- macmini and a Muse VM can both be attached, and neither evicts the other.
+- Muse as a caller keeps its token and URL (`/mcp` defaults to macmini). Muse as a computer
   needs a VM secret and a daemon that dials out.
-- The hub becomes a map of slots, each with its own pending table, `max_inflight`, ping
-  liveness and generation counter. A slow or dead computer cannot starve another.
-- Memory and audit grow with the number of computers. Expected scale is single digits.
+- Moving macmini's config from `default` to `macmini` is a relabel. The attached instance-mcp
+  is not closed, which matters because a daemon that gets `4003` stops until someone
+  restarts it (instance-mcp `ReverseAttachClient.swift:125`, `sb_daemon.py:35`).
+- Memory and audit grow with the number of computers. The expected scale is single digits.
 
 ## Not in v2
 
 - Routing a call to "any available computer", load balancing, fan-out.
 - Computer-to-computer calls through the switchboard.
 - Self-registration or enrolment tokens for computers.
-- Per-caller rate limits (beyond per-computer `max_inflight`).
+- Rate limits beyond per-computer and per-client in-flight caps.
 - Persisting anything across restarts.
 
 ## Alternatives considered
@@ -164,25 +269,54 @@ one wins.
   N configs, N tokens per caller, N approvals for Muse, and no single place to answer "which
   computers exist".
 - **Namespaced tool names on one `/mcp`.** One server entry per caller, but tool names
-  change, Connect breaks, and a model sees 3× the tool list for three computers.
-- **`computer` argument on every tool.** Same single endpoint, but every tool schema is
-  rewritten and a forgotten argument is a call to the wrong machine.
-- **Computer chosen by URL on attach (`/vm/attach/{name}`).** Redundant with the secret, and
-  lets a computer that knows another's name try its secret against it. The secret already
-  says who it is.
+  change, Connect breaks, and a model sees three times the tool list for three computers.
+- **A `computer` argument on every tool.** Same single endpoint, but every tool schema is
+  rewritten, and a forgotten argument becomes a call to the wrong machine.
+- **Computer chosen by URL on attach (`/vm/attach/{name}`).** It adds nothing, because the
+  secret already identifies the computer, and it would change the URL that instance-mcp
+  0.8.0 and `sb_daemon.py` already dial.
+- **`/mcp` answering with only a `list_computers` tool for multi-computer callers.**
+  Rejected: adding a second computer would silently break every client configured on `/mcp`.
 
-## Rollout
+## Rollout and tests
 
-1. Config model + loader with v1 compatibility (unit tests: v1 config, duplicate verifiers,
-   unknown computer in a client, `[vm]` + `[[computer]]` refused).
-2. Hub as a map of slots; per-computer takeover, revoke, liveness (e2e: two fake VMs attached
-   together; evicting one leaves the other; rotating one leaves the other).
-3. `/mcp/{computer}`, `/computers`, `/readyz/{computer}`; `/mcp` single-computer fallback
-   (e2e: deny-by-default is indistinguishable from unknown).
-4. `[[pty_attach]].computer`.
-5. Deploy on macmini with `default` renamed to `macmini`; Muse caller moves to `/mcp/macmini`.
-6. **First second computer: Muse's VM.** Needs, on Muse's side: a daemon that dials
-   `/vm/attach` through its `:3130` proxy (`sb_daemon.py` today; the Linux instance-mcp port
-   has no switchboard mode yet, which is the instance-mcp follow-up), a place for the VM
-   secret, and the daemon staying up between conversations. Those are the questions to ask
-   Muse before step 6.
+1. **Config model and loader.** Unit tests:
+   - a v1 config maps to `default` exactly;
+   - `[vm]` together with `[[computer]]` is refused;
+   - a duplicate verifier is refused, between computers and between a computer and a client;
+   - `"*"` mixed with named computers is refused;
+   - an empty `computers` table is refused;
+   - a `.` in a computer name is refused with a message;
+   - a multi-computer or `"*"` caller without `default_computer` is refused;
+   - a client keeping `tools` beside `[[computer]]` is refused;
+   - `[[pty_attach]]` without `computer` is refused when there are several computers;
+   - `check` warns about a computer no caller may use.
+2. **The hub as a map.** End-to-end tests:
+   - two fake computers stay attached together;
+   - evicting, rotating or removing one leaves the other attached and its calls succeeding;
+   - a same-verifier rename keeps the socket;
+   - swapping two verifiers between names evicts nothing;
+   - an attach authenticated just before its verifier is removed is refused with `4003`;
+   - per-computer in-flight isolation: one computer full, the other still answers;
+   - the per-client cap leaves room for a second caller on the same computer.
+3. **Routes.** End-to-end tests:
+   - `/mcp/{computer}`, `/computers` and `/readyz/{computer}` work for allowed computers;
+   - `/mcp/{unknown}` without a token is `401`;
+   - unknown and not-allowed give identical responses on every route;
+   - a `"*"` caller's `/mcp` `tools/list` is identical before and after a computer is added;
+   - `/readyz` is unchanged with one computer and gives `ready N/M` with several;
+   - `peer` is hidden from non-`"*"` callers.
+4. **`[[pty_attach]].computer`.**
+5. **Deploy on macmini**: relabel `default` to `macmini` by reload, and confirm instance-mcp
+   stays attached throughout.
+6. **First second computer: Muse's VM.** Open questions for Muse before this step:
+   - Can a WebSocket upgrade cross its TCP-only `:3130` HTTP proxy? That needs `CONNECT`, and
+     proxy support in the daemon's WebSocket library.
+   - Where does the VM secret live? The Secure Credentials Store injects headers into HTTPS
+     requests; does it do the same for a WebSocket upgrade?
+   - Does the daemon stay up between conversations?
+   - Which tools can the VM offer? `sb_daemon.py` needs X11 for `screenshot`, `mouse` and
+     `key`.
+
+   On our side: the Linux instance-mcp port has no switchboard mode yet (an instance-mcp
+   follow-up), so step 6 starts with `sb_daemon.py`.
