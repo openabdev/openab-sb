@@ -198,7 +198,8 @@ Without `computer` and with more than one computer configured, the config is ref
   empty, `config.rs:87-89`).
 - `GET /status` (client token) lists only the caller's computers.
   - The socket peer (`hub.rs:243-252`, taken from forwarded identity headers,
-    `server.rs:104-123`) and the in-flight count are shown only to `"*"` callers.
+    `server.rs:104-123`) and the in-flight count are shown only to `"*"` callers,
+    whatever the number of computers configured.
   - Other callers see each computer's name, `attached`, `ready`, `server`,
     `attached_for_secs` and `max_in_flight` (`hub.rs:243-252`). Only `peer` and `in_flight`
     are hidden.
@@ -248,7 +249,8 @@ v2 adds a per-client cap on each computer:
 | Same verifier, new name | the live socket is relabelled, and an audit line `computer_renamed` records it. No close |
 | A verifier moved from one name to another | a relabel, not a revoke |
 | `max_inflight` (global or per computer) | **new in v2**: reloaded, and applied to that computer's next attach. A live socket keeps the value it attached with (`hub.rs:352`). In v1 limits need a restart (`main.rs:130`) |
-| `[[pty_attach]]` added, removed or changed, `listen`, timeouts | need a restart, as in v1 (`server.rs:90-99`, `main.rs:130`) |
+| A `[[pty_attach]]`'s `computer`, `tools` or `max_inflight` changed | **new in v2**: swapped on the running attacher, in force from that attach's next request. An attach resolves its policy per request, by attach name, so a computer renamed under it keeps serving the pod — caching it instead answers that pod's CLI "the VM is not connected" for ever, with nothing closed and nothing logged |
+| `[[pty_attach]]` added or removed, or its `url` or `secret_file` changed, `listen`, timeouts | need a restart, as in v1 (`server.rs:90-99`, `main.rs:130`). The socket is already dialled, so these cannot be moved under it; each is reported at `warn` on reload |
 | Per-caller `max_inflight` | from that caller's next call |
 
 Reload stays hub-first, as v1's `reload_auth` does (`server.rs:81-90`). The computer table
@@ -266,7 +268,10 @@ A v1 config loads unchanged:
 - Top-level `max_inflight` stays the per-computer default.
 
 Nothing a v1 caller or daemon sees changes: `/mcp`, `/readyz`, `/status` and the close codes
-behave as before while there is one computer.
+behave as before while there is one computer. The one exception is that `peer` and `in_flight`
+in `/status` and `vm_status` are now shown only to callers granted
+`computers = { "*" = … }`, and a v1 client's `tools = ["*"]` maps to
+`computers = { default = ["*"] }`, which is a named grant — so it no longer sees them.
 
 ## Consequences
 
@@ -324,10 +329,16 @@ behave as before while there is one computer.
    - evicting, rotating or removing one leaves the other attached and its calls succeeding;
    - a same-verifier rename keeps the socket;
    - swapping two verifiers between names evicts nothing;
-   - an attach authenticated just before its verifier is removed is refused with `4003`;
+   - an attach authenticated just before its verifier is removed is refused with `4003`
+     — covered by a hub unit test of `install()`
+     (`install_refuses_a_secret_rotated_out_after_the_upgrade_check`), because the `serve()`
+     branch that sends `Close(4003)` at attach needs a reload to land between the upgrade
+     check and the install and is not deterministically reachable from a client;
    - per-computer in-flight isolation: one computer full, the other still answers;
    - the per-caller cap leaves room for a second caller on the same computer, and applies to
      a pty attach as well as a client;
+   - a caller whose HTTP client disconnects mid-call gets its share back at once, rather than
+     when the computer answers or the socket closes;
 3. **Routes.** End-to-end tests:
    - `/mcp/{computer}`, `/computers` and `/readyz/{computer}` work for allowed computers;
    - `/mcp/{unknown}` and `/readyz/{unknown}` without a token are `401`;
@@ -336,7 +347,9 @@ behave as before while there is one computer.
    - a `"*"` caller's `/mcp` `tools/list` is identical before and after a computer is added;
    - `/readyz` is unchanged with one computer, and with several is 200 when any is ready;
    - `peer` is hidden from non-`"*"` callers.
-4. **`[[pty_attach]].computer`.**
+4. **`[[pty_attach]].computer`.** End-to-end tests: an attach lends the computer it names and
+   not the first one configured; and it keeps serving the pod through a same-verifier rename
+   of that computer, which is the reload path a running attach must follow.
 5. **Deploy on macmini.** Swapping the binary is a restart: instance-mcp gets `1001` and
    redials (`ReverseAttachClient.swift:126`). After that, relabel `default` to `macmini` by
    reload and confirm instance-mcp stays attached through the reload.

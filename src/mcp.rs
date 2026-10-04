@@ -1,20 +1,22 @@
 //! The MCP surface callers see, shared by every northbound adapter (HTTP for
-//! Connect, the reverse attach toward openab-pty). The switchboard answers the
-//! handshake itself, filters `tools/list` by the caller's allowlist, refuses
-//! disallowed calls before they reach the VM, and forwards the rest.
+//! Connect, the reverse attach toward openab-pty). One [`Caller`] is one
+//! computer's MCP server: the switchboard answers the handshake itself, filters
+//! `tools/list` by that caller's allowlist on that computer, refuses disallowed
+//! calls before they reach the computer, and forwards the rest.
 //!
 //! Only `initialize`, `ping`, `tools/list` and `tools/call` are served. Every
 //! other method is refused here rather than forwarded: the switchboard is a
 //! closed relay for tools, not a generic MCP proxy.
 
 use crate::audit::Audit;
-use crate::config::{Principal, Timeouts};
+use crate::config::{Caller, Timeouts};
 use crate::hub::{rpc_error, CallError, Hub, MCP_PROTOCOL_VERSION};
 use serde_json::{json, Value};
 use std::sync::Arc;
 use std::time::Instant;
 
-/// Tool the switchboard answers itself, attached or not.
+/// Tool the switchboard answers itself, attached or not. Keeps its v1 name for
+/// compatibility and gained a `computer` field.
 pub const STATUS_TOOL: &str = "vm_status";
 /// Longest tool name accepted; names land in audit lines.
 pub const MAX_TOOL_NAME_CHARS: usize = 128;
@@ -27,8 +29,9 @@ pub struct Mcp {
 }
 
 impl Mcp {
-    /// Answer one JSON-RPC message. `None` = it was a notification.
-    pub async fn handle(&self, who: &Principal, request: Value) -> Option<Value> {
+    /// Answer one JSON-RPC message for one caller on one computer. `None` = it
+    /// was a notification.
+    pub async fn handle(&self, who: &Caller, request: Value) -> Option<Value> {
         let Some(object) = request.as_object() else {
             return Some(rpc_error(
                 Value::Null,
@@ -51,7 +54,7 @@ impl Mcp {
         };
         let method = method.to_owned();
         match method.as_str() {
-            "initialize" => Some(self.initialize(id, &request)),
+            "initialize" => Some(self.initialize(who, id, &request)),
             "ping" => Some(json!({ "jsonrpc": "2.0", "id": id, "result": {} })),
             "tools/list" => Some(self.tools_list(who, id, request).await),
             "tools/call" => Some(self.tools_call(who, id, request).await),
@@ -63,7 +66,7 @@ impl Mcp {
         }
     }
 
-    fn initialize(&self, id: Value, request: &Value) -> Value {
+    fn initialize(&self, who: &Caller, id: Value, request: &Value) -> Value {
         let offered = request
             .pointer("/params/protocolVersion")
             .and_then(Value::as_str)
@@ -72,10 +75,22 @@ impl Mcp {
             "2025-06-18" | "2025-03-26" => offered,
             _ => MCP_PROTOCOL_VERSION,
         };
-        let instructions = if self.hub.is_ready() {
-            "A remote VM is connected through OpenAB Switchboard. Its tools are listed under tools/list alongside vm_status. Calls are relayed over the network: expect latency of a second or more, and never assume a timed-out call did not run."
+        // Name the computer: a model holding two switchboard servers has no
+        // other way to tell which machine it is about to touch.
+        let instructions = if self.hub.is_ready(&who.computer) {
+            format!(
+                "A remote computer is connected through OpenAB Switchboard as `{}`. Its tools \
+                 are listed under tools/list alongside vm_status. Calls are relayed over the \
+                 network: expect latency of a second or more, and never assume a timed-out \
+                 call did not run.",
+                who.computer
+            )
         } else {
-            "The remote VM is not connected right now. Only vm_status is available; call it, or tools/list again later."
+            format!(
+                "The remote computer `{}` is not connected to OpenAB Switchboard right now. \
+                 Only vm_status is available; call it, or tools/list again later.",
+                who.computer
+            )
         };
         json!({
             "jsonrpc": "2.0",
@@ -89,22 +104,39 @@ impl Mcp {
         })
     }
 
-    fn status_tool() -> Value {
+    fn status_tool(computer: &str) -> Value {
         json!({
             "name": STATUS_TOOL,
-            "description": "Whether the remote VM is connected to OpenAB Switchboard, since when, and what it reported about itself. Answered by the switchboard; works when the VM is offline.",
+            "description": format!(
+                "Whether the remote computer `{computer}` is connected to OpenAB Switchboard, \
+                 since when, and what it reported about itself. Answered by the switchboard; \
+                 works when the computer is offline."
+            ),
             "inputSchema": { "type": "object", "properties": {}, "additionalProperties": false }
         })
     }
 
-    async fn tools_list(&self, who: &Principal, id: Value, request: Value) -> Value {
-        let only_status = || json!({ "jsonrpc": "2.0", "id": id.clone(), "result": { "tools": [Self::status_tool()] } });
+    async fn tools_list(&self, who: &Caller, id: Value, request: Value) -> Value {
+        let only_status = || {
+            json!({ "jsonrpc": "2.0", "id": id.clone(),
+                    "result": { "tools": [Self::status_tool(&who.computer)] } })
+        };
         let forwarded = json!({
             "jsonrpc": "2.0",
             "method": "tools/list",
             "params": request.get("params").cloned().unwrap_or_else(|| json!({}))
         });
-        let mut response = match self.hub.call(forwarded, self.timeouts.control).await {
+        let mut response = match self
+            .hub
+            .call(
+                &who.computer,
+                &who.principal,
+                who.max_inflight,
+                forwarded,
+                self.timeouts.control,
+            )
+            .await
+        {
             Ok(response) => response,
             Err(CallError::NotAttached) => return only_status(),
             Err(error) => return rpc_error(id, error.rpc_code(), error.message()),
@@ -112,7 +144,8 @@ impl Mcp {
         if let Some(error) = response.get("error") {
             // Not an error to the caller: an MCP client may drop a server whose
             // tools/list fails. `vm_status` stays callable to explain.
-            tracing::warn!(%error, "VM answered tools/list with an error");
+            tracing::warn!(%error, computer = %who.computer,
+                           "computer answered tools/list with an error");
             return only_status();
         }
         let Some(tools) = response
@@ -127,15 +160,15 @@ impl Mcp {
                 .and_then(Value::as_str)
                 .is_some_and(|name| name != STATUS_TOOL && who.tools.allows(name))
         });
-        tools.push(Self::status_tool());
-        // Pagination stays the VM's business; the cursor passes through.
+        tools.push(Self::status_tool(&who.computer));
+        // Pagination stays the computer's business; the cursor passes through.
         if let Some(object) = response.as_object_mut() {
             object.insert("id".into(), id);
         }
         response
     }
 
-    async fn tools_call(&self, who: &Principal, id: Value, request: Value) -> Value {
+    async fn tools_call(&self, who: &Caller, id: Value, request: Value) -> Value {
         let params = request.get("params");
         let Some(name) = params
             .and_then(|p| p.get("name"))
@@ -158,7 +191,8 @@ impl Mcp {
             self.audit.event(
                 "call",
                 json!({
-                    "principal": who.name,
+                    "principal": who.principal,
+                    "computer": who.computer,
                     "tool": name,
                     "outcome": outcome,
                     "error_code": code,
@@ -170,7 +204,9 @@ impl Mcp {
         };
 
         if name == STATUS_TOOL {
-            let status = self.hub.status();
+            let status = self
+                .hub
+                .status(&who.computer, self.hub.shows_internals(who.wildcard));
             record("ok", None, 0);
             return tool_result(id, status.to_string(), Some(status), false);
         }
@@ -180,8 +216,8 @@ impl Mcp {
             return tool_result(
                 id,
                 format!(
-                    "tool `{name}` is not allowed for `{}` by the switchboard's policy",
-                    who.name
+                    "tool `{name}` is not allowed for `{}` on `{}` by the switchboard's policy",
+                    who.principal, who.computer
                 ),
                 None,
                 true,
@@ -195,7 +231,13 @@ impl Mcp {
         });
         match self
             .hub
-            .call(forwarded, self.timeouts.for_tool(&name))
+            .call(
+                &who.computer,
+                &who.principal,
+                who.max_inflight,
+                forwarded,
+                self.timeouts.for_tool(&name),
+            )
             .await
         {
             Ok(mut response) => {

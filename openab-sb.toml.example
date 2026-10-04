@@ -1,11 +1,17 @@
 # openab-sb.toml — every credential here is a verifier (`sha256:…`), never a secret.
 # Make pairs with `openab-sb gen-secret`; the secret goes to the other party.
+#
+# v2 shape: one `[[computer]]` block per machine with the hands, and every caller
+# granted access per computer. A v1 file with a single `[vm]` block still loads —
+# it becomes one computer named `default`, and a client's `tools = [...]` becomes
+# `computers = { default = [...] }`.
 
 # Loopback by default. Front it with `tailscale serve` or a tunnel for TLS.
 listen = "127.0.0.1:8790"
 # allow_insecure_bind = true   # only for a private network, bearer tokens in clear
 
-# Requests in flight toward the VM; extra calls are rejected, not queued.
+# Default requests in flight toward one computer; extra calls are rejected, not
+# queued. Each `[[computer]]` may override it.
 max_inflight = 8
 
 # Audit log: JSON lines. Omit for stdout. `audit_args = false` drops call arguments
@@ -13,9 +19,20 @@ max_inflight = 8
 # audit_path = "~/.local/state/openab-sb/audit.jsonl"
 audit_args = true
 
-[vm]
-# The dial-out daemon presents the matching secret on `GET /vm/attach`.
+# Each computer dials `GET /vm/attach` with its own secret. The secret alone
+# selects the slot; the name here is the label used in routes, policy and audit,
+# and it attests possession of that secret, not a particular machine.
+# Names are 1-64 chars of [A-Za-z0-9_-] — no `.`, because a bare TOML key such as
+# `rpi1.local` is a dotted key. Renaming a computer without changing its secret
+# relabels the live socket and closes nothing.
+[[computer]]
+name = "macmini"
 secret_sha256 = "sha256:REPLACE_ME"
+
+[[computer]]
+name = "muse-vm"
+secret_sha256 = "sha256:REPLACE_ME"
+max_inflight = 4
 
 [timeouts]
 default_secs = 60   # any tool without its own entry
@@ -24,26 +41,37 @@ control_secs = 15   # tools/list
 screenshot = 10
 bash = 60
 
-# Northbound callers: POST /mcp with `Authorization: Bearer <token>`.
-# `tools` is the allowlist ("*" = all). `vm_status` is always available.
-# An allowlist is policy, not isolation: `key` and `mouse` can reach a shell.
+# Northbound callers: POST /mcp/<computer> with `Authorization: Bearer <token>`,
+# or bare POST /mcp for `default_computer`. Deny by default: a computer missing
+# from `computers` does not exist for that caller, on every route.
+# A tool list is policy, not isolation: `key` and `mouse` can reach a shell.
+# `vm_status` is always available.
 [[client]]
 name = "connect"
 token_sha256 = "sha256:REPLACE_ME"
-tools = ["sys_info", "screenshot", "mouse", "key"]
+default_computer = "macmini"
+computers = { macmini = ["sys_info", "screenshot", "mouse", "key"], muse-vm = ["sys_info"] }
 
+# `"*"` is every computer, including ones configured later: for the owner only.
+# It cannot be mixed with names, and it still needs `default_computer` so that
+# bare POST /mcp never changes meaning when a computer is added.
 [[client]]
 name = "agent"
 token_sha256 = "sha256:REPLACE_ME"
-tools = ["*"]
+default_computer = "macmini"
+computers = { "*" = ["*"] }
+# max_inflight = 4   # this caller's share of one computer; default is half of
+#                    # the computer's max_inflight, rounded up
 
-# Lend the VM to an openab-pty session (CLIENT-CONTRACT §9). The switchboard
+# Lend one computer to an openab-pty session (CLIENT-CONTRACT §9). The switchboard
 # dials the pod; the secret comes from
 #   POST /admin/sessions/{session}/tools-attach
 # and is re-read from `secret_file` on every dial, so re-minting heals in place.
 # [[pty_attach]]
 # name = "kiro-1040"
+# computer = "muse-vm"               # required when more than one is configured
 # url = "wss://kiro-1040.<tailnet>.ts.net/tools/attach/laptop"
 # secret_file = "~/.config/openab-sb/kiro-1040.secret"
 # tools = ["*"]
+# max_inflight = 8
 # allow_insecure_transport = false   # true to allow ws:// to a tailnet IP
