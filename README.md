@@ -1,12 +1,13 @@
 # openab-sb — OpenAB Switchboard
 
-Lets OpenAB Connect and agents in OpenAB PTY sessions call tools on machines that
-**can only dial out** — a Meta Muse Secure VM, a box behind NAT, anything with no inbound
-port and no `tailscale serve`.
+A generic switchboard that lets agents use tools on **computers you own that can only dial
+out** — most usefully, **the browser on a machine in your own network instead of a cloud VM's**.
 
-Each machine dials the switchboard over one WebSocket and serves MCP on it. The switchboard
-relays calls down that socket and sends the results back. It does not run tools and it
-does not store anything.
+Callers can be an `openab-pty` session, OpenAB Connect, or any agent that can call a remote MCP
+server with a bearer token (Muse, Grok Bot, OpenAI Dots, Claude Duet, …; see
+[Callers](#callers)). Each computer dials the switchboard over one WebSocket and serves MCP on it.
+The switchboard relays calls down that socket and sends the results back. It does not run tools and
+it does not store anything.
 
 One switchboard serves **many computers**: one port, one `tailscale serve` entry, one
 approved address, and one endpoint per computer. Callers are granted access per computer,
@@ -16,7 +17,7 @@ deny by default.
 flowchart LR
     subgraph callers["Callers"]
         connect["OpenAB Connect<br/>(Mac app)"]
-        agent["Agent with<br/>its own token"]
+        agents["Cloud agents<br/>Muse, Grok Bot, OpenAI Dots,<br/>Claude Duet, …<br/>each with its own token"]
         subgraph pod["openab-pty pod"]
             cli["Coding CLI<br/>in session S"]
             rt["openab-pty runtime<br/>tools plane §9"]
@@ -34,15 +35,19 @@ flowchart LR
         hub -.-> audit
     end
 
-    subgraph macmini["Computer: macmini"]
-        imcp["instance-mcp<br/>switchboard mode"]
+    subgraph home["Your network — outbound only"]
+        subgraph macmini["Computer: macmini"]
+            imcp["instance-mcp<br/>switchboard mode"]
+            browser["Private browser<br/>your IP, your profile"]
+            imcp --> browser
+        end
     end
-    subgraph vm["Computer: muse-vm"]
+    subgraph vm["Computer: muse-vm (a cloud VM)"]
         daemon["sb_daemon<br/>MCP server"]
     end
 
     connect -- "HTTPS, Bearer client token" --> mcp
-    agent -- "HTTPS, Bearer client token" --> mcp
+    agents -- "HTTPS, Bearer client token" --> mcp
     rt <== "WS /tools/attach/S<br/>dialled by openab-sb<br/>Bearer grant secret" ==> dialer
     hub <== "WS /vm/attach<br/>dialled by the computer<br/>Bearer its own secret" ==> imcp
     hub <== "WS /vm/attach" ==> daemon
@@ -52,6 +57,36 @@ Thick links are WebSockets, and each label says which side dials. Calls always f
 the callers toward a computer: a computer dials in and then serves MCP on its own socket,
 and the switchboard dials the pod and then answers the pod's requests on that socket. TLS
 comes from whatever fronts the switchboard (`tailscale serve` or `cloudflared`; see Run).
+
+## Use your own browser, not the cloud VM's
+
+An agent's built-in browser runs in the vendor's environment: it shows that environment's network
+address and holds none of your logins. A computer in your own network has your address (for
+example your home ISP) and your browser profile, but it sits behind NAT and cannot be reached from
+the cloud. The switchboard bridges the two without opening an inbound port: the computer dials out,
+the agent calls in, and the switchboard relays between them. The per-caller allowlist decides which
+tools each agent may use, for example the browser tools only.
+
+A worked example, with a Mac mini at home, Muse as the caller, the switchboard on a separate
+tailnet host, a diagram and the results of the proof of concept, is in
+[`docs/reference-architecture-muse-home-browser.md`](docs/reference-architecture-muse-home-browser.md).
+
+**Read the trust note first.** A browser tool call runs in the computer's browser profile, with its
+cookies and signed-in sessions. Use a dedicated profile that is signed in only to what the task
+needs, not your daily one (see [Trust](#trust)).
+
+## Callers
+
+| Caller | How it connects | Status |
+|---|---|---|
+| `openab-pty` session | the switchboard dials the pod's `/tools/attach/{session}` (`[[pty_attach]]`); the CLI keeps using `$OPENAB_TOOLS_MCP_URL` | in this README and covered by the e2e tests against a fake pod |
+| OpenAB Connect | `https://<switchboard>/mcp/<computer>` with a client token | described below |
+| Muse | remote MCP through its custom connector, with a bearer token | proof of concept run end to end on 2026-10-26, see the reference architecture |
+| Grok Bot, OpenAI Dots, Claude Duet | any client that can call a remote MCP server with a bearer header | **not tested**; whether each can add such a server has not been checked |
+
+A caller needs only three things: an HTTPS route to the switchboard, a client token, and an MCP
+client that can send `Authorization: Bearer`. How a given agent reaches the switchboard (a tailnet
+proxy, a public front) depends on that agent's own network rules.
 
 ## How it fits
 
@@ -223,6 +258,12 @@ intersection. The real boundary is that the computer itself can be thrown away.
 A `"*"` caller gains access to a new computer the moment it is configured, with no change to
 its own block. It is meant for the owner, and startup and `check` name every client that
 uses it.
+
+The "computer can be thrown away" boundary above does not hold for a **private browser**. A signed-in
+profile is the whole point of that use, so the agent can act as every account the profile is signed
+in to. Give it a dedicated profile, keep the allowlist to the browser tools you need, and remember
+that `screenshot` captures the whole desktop, not only the browser. Do not run `audit_args = true`
+if typed text may include secrets.
 
 Tool output flows to callers unchanged. Screenshots and shell output from a computer that
 browses the web can carry prompt injection, so callers should treat that output as untrusted.
