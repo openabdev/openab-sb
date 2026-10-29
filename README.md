@@ -37,7 +37,7 @@ flowchart LR
 
     subgraph home["Your network — outbound only"]
         subgraph macmini["Computer: macmini"]
-            imcp["instance-mcp<br/>switchboard mode"]
+            imcp["OpenAB Computer<br/>switchboard mode"]
             browser["Private browser<br/>your IP, your profile"]
             imcp --> browser
         end
@@ -109,7 +109,7 @@ proxy, a public front) depends on that agent's own network rules.
   `[[pty_attach]]`, so the CLI in that session reaches them through its usual
   `$OPENAB_TOOLS_MCP_URL`. An agent that can reach the switchboard directly can also use
   `POST /mcp/<computer>` with its own token.
-- **Pickers** (instance-mcp's hands-node registry, Connect) read `GET /computers`. There is no
+- **Pickers** (OpenAB Computer's hands-node registry, Connect) read `GET /computers`. There is no
   `list_computers` MCP tool: a model already on `/mcp/<computer>` could not act on such a list.
 
 ## Config
@@ -252,7 +252,7 @@ verifiers, so its config file cannot be used to dial in or to call out.
 
 The allowlist is policy, not isolation. `key` and `mouse` can open a terminal, so a caller
 allowed those tools is effectively allowed a shell. The computer's own profile
-(instance-mcp `observe`/`desktop`/`owner`) remains the ceiling and the caller gets the
+(OpenAB Computer `observe`/`desktop`/`owner`) remains the ceiling and the caller gets the
 intersection. The real boundary is that the computer itself can be thrown away.
 
 A `"*"` caller gains access to a new computer the moment it is configured, with no change to

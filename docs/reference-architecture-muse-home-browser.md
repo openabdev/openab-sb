@@ -96,7 +96,7 @@ flowchart LR
 | TLS front | switchboard host | Terminates TLS. The PoC uses `tailscale serve` (tailnet only), so Muse must reach the tailnet; a public tunnel such as `cloudflared` is the alternative when it cannot |
 | `openab-sb` | switchboard host | Authenticates, picks the computer from the path, applies the per-caller tool allowlist, relays |
 | `oab-instance-mcp` | macmini | Dials the switchboard, serves tools on that socket under one profile |
-| Playwright MCP | macmini | Loopback MCP server driving the browser (`poc/pw-mcp` in instance-mcp) |
+| Playwright MCP | macmini | Loopback MCP server driving the browser (`poc/pw-mcp` in OpenAB Computer) |
 | Chromium | macmini | The browser, with the persistent profile |
 
 ## Call flow
@@ -143,7 +143,7 @@ computers = { macmini = [
 max_inflight = 2
 ```
 
-The list above is the instance-mcp `desktop` browser set
+The list above is the OpenAB Computer `desktop` browser set
 (`ToolProfile.desktopBrowserTools`) plus `sys_info`. Trim it further if the task allows.
 Deliberately **absent**: `mouse`, `key`, `osascript`, `exec*`, `screenshot` of the whole
 desktop. Then `openab-sb check -c openab-sb.toml` and `openab-sb serve -c openab-sb.toml`.
@@ -151,7 +151,7 @@ Put TLS in front — see [Exposing the switchboard](#exposing-the-switchboard).
 
 ### 2. Mac mini
 
-Install the Playwright MCP upstream (`poc/pw-mcp/install.sh` in instance-mcp), then give
+Install the Playwright MCP upstream (`poc/pw-mcp/install.sh` in OpenAB Computer), then give
 `oab-instance-mcp` the switchboard URL, the computer secret and the upstream:
 
 ```sh
@@ -246,12 +246,12 @@ address, and open a site the profile is logged in to.
 
 ## Limits of this reference
 
-- **macOS only today for `--switchboard`.** In instance-mcp `main`, `--switchboard` exists in
+- **macOS only today for `--switchboard`.** In OpenAB Computer `main`, `--switchboard` exists in
   the Swift daemon. The Linux Rust hands node (`poc/reverse-attach-linux`) has no switchboard
   mode, so a Raspberry Pi or mini PC would need a daemon that follows
   [`SOUTHBOUND-CONTRACT.md`](SOUTHBOUND-CONTRACT.md) (see `examples/muse-daemon/sb_daemon.py`)
   and its own browser tooling.
-- **No browser-only profile yet.** `desktop` still includes GUI tools; instance-mcp tracks a
+- **No browser-only profile yet.** `desktop` still includes GUI tools; OpenAB Computer tracks a
   narrower browser tier in its #45. Until then the switchboard allowlist is the control.
 - **One socket per computer.** A second daemon with the same secret evicts the first (`4002`).
 - **Verified on the PoC, with one caveat.** The path from Muse to the computer, and a browser call that
