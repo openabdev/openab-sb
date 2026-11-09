@@ -200,20 +200,29 @@ replaced, at any depth and inside arrays: a string becomes `"<redacted:N chars>"
 else (a number, an object, a list) becomes `"<redacted>"`. Only the audit copy changes; the
 computer receives the real arguments.
 
-Names are compared case-insensitively and ignoring `-` and `_`, so `privateKey`,
-`private_key` and `Private-Key` are the same name. Redacted by default:
+Names are compared case-insensitively and ignoring `-`, `_`, `.` and spaces, so `privateKey`,
+`private_key`, `Private-Key` and `private key` are the same name. Redacted by default:
 
 - exactly `value`, `values`, `text`, `password`, `passphrase`, `secret`, `token`, `pin`,
-  `otp`, `pwd`. This covers `ui_action` `set_value` (which may fill a password field), `key`
-  `type`, and browser typing and form-filling tools;
+  `otp`, `pwd`, `pass`, `auth`, `key`, `cvv`, `cvc`, `session`, `session_id`. This covers
+  `ui_action` `set_value` (which may fill a password field), `key` `type`, and browser typing
+  and form-filling tools. `key` is matched exactly, so `keys` (what `key` `press` sends) and
+  `keyboard` are kept;
 - any name containing `password`, `passwd`, `passphrase`, `secret`, `token`, `api_key`,
-  `apikey`, `credential`, `cookie`, `authorization`, `private_key` or `access_key`.
+  `apikey`, `credential`, `cookie`, `authorization`, `private_key`, `access_key`,
+  `auth_key`, `passcode`, `bearer`, `jwt` or `privkey`;
+- every value inside an `env`, `environment` or `headers` object, such as `exec`'s `env`.
+  The variable and header names are kept, because a name like `GH_PAT` or `DATABASE_URL`
+  says nothing about whether its value is secret. If one of these is not an object (a list
+  of header pairs, say), it is replaced whole.
 
 `audit_redact_keys = ["otp_code", "card_number"]` adds exact names. It cannot remove a
 default; to record no arguments at all, set `audit_args = false`. A change to any of these
 settings needs a restart; a `SIGHUP` that sees one logs a warning. Free-form arguments are
-not inspected: a password inside a `bash` `command`, a token in a `url` query string or
-`user:pass@` part, or keys sent with `key` `press`, is still recorded. Turn `audit_args` off when callers may do that.
+not inspected: a password inside a `bash` `command` or an `osascript` `script` (AppleScript
+`keystroke`), a token in a `url` query string or `user:pass@` part, keys sent with `key`
+`press`, a secret in a name/content pair (`{"name": "password", "content": …}`) or in a
+string that holds JSON, is still recorded. Turn `audit_args` off when callers may do that.
 
 Upgrading does not rewrite an existing audit file. If a switchboard before this change ran
 with `audit_args = true` and callers may have sent secrets (`ui_action` `set_value`, `key`

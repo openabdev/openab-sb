@@ -706,7 +706,7 @@ async fn allowlist_filters_listing_and_blocks_calls_before_the_vm() {
 
 /// A secret sent as a call argument must never reach the audit file: not from
 /// `ui_action` `set_value`, not from typed text, not nested in a form, not under
-/// a camelCase name, not under an operator-added name, not on a denied call, and not from the response (the
+/// a camelCase name, not in an `exec` `env`, not under an operator-added name, not on a denied call, and not from the response (the
 /// fake computer echoes its arguments back).
 #[tokio::test]
 async fn secret_arguments_never_reach_the_audit_file() {
@@ -730,12 +730,16 @@ async fn secret_arguments_never_reach_the_audit_file() {
         ),
         (
             "login",
-            json!({"user": "me", "auth": {"api_token": canary}}),
+            json!({"user": "me", "account": {"api_token": canary, "authKey": canary}}),
         ),
         ("mfa", json!({"otp_code": canary})),
         (
             "deploy",
-            json!({"target": "web", "auth": [{"sshPrivateKey": canary, "privateKey": canary}]}),
+            json!({"target": "web", "hosts": [{"sshPrivateKey": canary, "privateKey": canary}]}),
+        ),
+        (
+            "exec",
+            json!({"command": "gh pr list", "env": {"GH_PAT": canary, "DB_PASS": canary}}),
         ),
     ];
     for (i, (tool, args)) in calls.iter().enumerate() {
@@ -788,6 +792,10 @@ async fn secret_arguments_never_reach_the_audit_file() {
     let recorded: Value = serde_json::from_str(form["args"].as_str().unwrap()).unwrap();
     assert_eq!(recorded["fields"][0]["name"], "Password");
     assert_eq!(recorded["fields"][0]["value"], json!(marker));
+    let exec = lines.iter().find(|l| l["tool"] == "exec").unwrap();
+    let recorded: Value = serde_json::from_str(exec["args"].as_str().unwrap()).unwrap();
+    assert_eq!(recorded["command"], "gh pr list");
+    assert_eq!(recorded["env"]["GH_PAT"], json!(marker));
 }
 
 #[tokio::test]

@@ -134,7 +134,7 @@ Same argument names as `oab-instance-mcp`, so agents that know one know the othe
 
 A switchboard with `audit_args` on records call arguments, but replaces any argument named
 `value` or `text`, or whose name contains `password`, `secret`, `token` (and a few more; see
-the README's "Audit redaction"). If a tool of yours takes a secret, name the argument so,
+the README's "Audit redaction"), and every value inside an `env` or `headers` object. If a tool of yours takes a secret, name the argument so,
 for example `value` or `password`, not `data` or `input`. Never echo a secret back in a
 result or error text either: results reach the caller unchanged.
 

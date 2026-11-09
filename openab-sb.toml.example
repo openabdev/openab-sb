@@ -15,9 +15,10 @@ listen = "127.0.0.1:8790"
 max_inflight = 8
 
 # Audit log: JSON lines. Omit for stdout. `audit_args = false` drops call arguments
-# from the log. With it on, secret-bearing arguments (`value`, `text`, and any name
-# containing password/secret/token/privateKey/…, at any depth) are recorded as
-# "<redacted:N chars>" (strings) or "<redacted>" (anything else).
+# from the log. With it on, secret-bearing arguments (`value`, `text`, `key`, and any
+# name containing password/secret/token/privateKey/…, at any depth), and every value
+# inside `env` or `headers`, are recorded as "<redacted:N chars>" (strings) or
+# "<redacted>" (anything else).
 # `audit_redact_keys` adds exact names; the defaults stay. Changes need a restart.
 # audit_path = "~/.local/state/openab-sb/audit.jsonl"
 audit_args = true

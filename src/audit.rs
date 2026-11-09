@@ -4,10 +4,11 @@
 //! With `audit_args` on, call arguments are recorded after [`redact`]: any
 //! argument, at any depth, whose name is secret-bearing ([`DEFAULT_REDACT_KEYS`],
 //! [`DEFAULT_REDACT_FRAGMENTS`], plus the operator's `audit_redact_keys`) is
-//! replaced with a marker. That covers `ui_action`'s `value` (which may go into
-//! a password field) and the `text` typed through `key`. Free-form arguments
-//! such as a `bash` `command` are not inspected, so the file is still created
-//! `0600`. Authentication failures come from
+//! replaced with a marker, and so is every value inside an [`DEFAULT_REDACT_CHILDREN`]
+//! object such as `exec`'s `env`. That covers `ui_action`'s `value` (which may
+//! go into a password field) and the `text` typed through `key`. Free-form
+//! arguments such as a `bash` `command` are not inspected, so the file is still
+//! created `0600`. Authentication failures come from
 //! unauthenticated callers, so they are rate-limited: a flood costs a summary
 //! line, not the disk.
 
@@ -20,10 +21,11 @@ use std::time::{Duration, Instant};
 
 /// Longest rendering of call arguments kept in an audit line.
 pub const MAX_AUDIT_ARGS_CHARS: usize = 512;
-/// Argument names (compared case-insensitively, ignoring `-` and `_`, so
-/// `Pass-Word`, `pass_word` and `passWord` are one name) whose value is never
-/// recorded: `value` is what `ui_action` `set_value` writes, `text` what
-/// `key` and browser typing tools type.
+/// Argument names (compared case-insensitively, ignoring `-`, `_`, `.` and
+/// spaces, so `Pass-Word`, `pass_word`, `Pass Word` and `passWord` are one
+/// name) whose value is never recorded: `value` is what `ui_action`
+/// `set_value` writes, `text` what `key` and browser typing tools type. `key`
+/// is exact on purpose: `keys` (what `key` `press` sends) is kept.
 pub const DEFAULT_REDACT_KEYS: &[&str] = &[
     "value",
     "values",
@@ -35,6 +37,13 @@ pub const DEFAULT_REDACT_KEYS: &[&str] = &[
     "pin",
     "otp",
     "pwd",
+    "pass",
+    "auth",
+    "key",
+    "cvv",
+    "cvc",
+    "session",
+    "session_id",
 ];
 /// A name containing any of these, compared the same way, is redacted too
 /// (`api_token`, `db_password`, `client_secret`, `Authorization`, `privateKey`,
@@ -52,7 +61,16 @@ pub const DEFAULT_REDACT_FRAGMENTS: &[&str] = &[
     "authorization",
     "private_key",
     "access_key",
+    "auth_key",
+    "passcode",
+    "bearer",
+    "jwt",
+    "privkey",
 ];
+/// Objects whose every value is redacted while their names are kept, because
+/// the names say nothing about the values: `exec`'s `env` (`GH_PAT`,
+/// `DATABASE_URL`, …) and HTTP `headers`. Not an object: replaced whole.
+pub const DEFAULT_REDACT_CHILDREN: &[&str] = &["env", "environment", "headers"];
 /// Authentication-failure lines written per window; the rest are counted.
 pub const AUTH_FAILURES_PER_WINDOW: u32 = 20;
 pub const AUTH_FAILURE_WINDOW: Duration = Duration::from_secs(60);
@@ -180,12 +198,12 @@ impl Audit {
     }
 }
 
-/// Lowercase with every `-` and `_` dropped, so camelCase, snake_case and
-/// kebab-case spellings of a name compare equal.
-fn normalise(name: &str) -> String {
+/// Lowercase with every `-`, `_`, `.` and space dropped, so camelCase,
+/// snake_case, kebab-case and spaced spellings of a name compare equal.
+pub fn normalise(name: &str) -> String {
     name.trim()
         .chars()
-        .filter(|c| *c != '-' && *c != '_')
+        .filter(|c| !matches!(c, '-' | '_' | '.') && !c.is_whitespace())
         .map(|c| c.to_ascii_lowercase())
         .collect()
 }
@@ -197,6 +215,11 @@ fn is_secret_name(name: &str, extra: &[String]) -> bool {
             .iter()
             .any(|f| name.contains(&normalise(f)))
         || extra.contains(&name)
+}
+
+fn is_redacted_container(name: &str) -> bool {
+    let name = normalise(name);
+    DEFAULT_REDACT_CHILDREN.iter().any(|k| normalise(k) == name)
 }
 
 /// What a redacted argument is recorded as: its length for a string (so an
@@ -218,6 +241,16 @@ pub fn redact(value: &Value, extra: &[String]) -> Value {
                 .map(|(k, v)| {
                     let v = if is_secret_name(k, extra) {
                         marker(v)
+                    } else if is_redacted_container(k) {
+                        match v {
+                            Value::Object(children) => Value::Object(
+                                children
+                                    .iter()
+                                    .map(|(n, c)| (n.clone(), marker(c)))
+                                    .collect(),
+                            ),
+                            other => marker(other),
+                        }
                     } else {
                         redact(v, extra)
                     };
@@ -292,7 +325,7 @@ mod tests {
             "fields": [{ "name": "pw", "ref": "e9", "value": canary }],
             "nested": { "deeper": { "Client_Secret": canary, "API-KEY": canary } },
             "one_time_code": canary,
-            "auth": { "password": { "raw": canary } },
+            "login": { "password": { "raw": canary } },
             "number": { "value": 42 },
         });
         let rendered = on.args(Some(&call)).unwrap();
@@ -305,7 +338,7 @@ mod tests {
         assert_eq!(parsed["nested"]["deeper"]["Client_Secret"], json!(len));
         assert_eq!(parsed["nested"]["deeper"]["API-KEY"], json!(len));
         assert_eq!(parsed["one_time_code"], json!(len));
-        assert_eq!(parsed["auth"]["password"], "<redacted>");
+        assert_eq!(parsed["login"]["password"], "<redacted>");
         assert_eq!(parsed["number"]["value"], "<redacted>");
         assert_eq!(parsed["snapshot_id"], "s1");
         assert_eq!(parsed["ref"], "e7");
@@ -329,6 +362,55 @@ mod tests {
         let rendered = on.args(Some(&call)).unwrap();
         assert!(!rendered.contains(canary), "{rendered}");
         assert!(rendered.contains("/tmp/keep"), "{rendered}");
+    }
+
+    #[test]
+    fn common_credential_names_are_redacted() {
+        let canary = "cred-canary-3a7e";
+        let on = Audit::with_sink(Box::new(std::io::sink()), true);
+        let call = json!({
+            "outer": [{ "inner": {
+                "authKey": canary, "auth_key": canary, "passcode": canary,
+                "bearer": canary, "bearerToken": canary, "jwt": canary, "idJwt": canary,
+                "pass": canary, "auth": canary, "key": canary, "cvv": canary, "cvc": canary,
+                "session": canary, "sessionId": canary, "privkey": canary,
+                "Pass Word": canary, "db.password": canary,
+            } }],
+            "author": "kept-author",
+            "keys": ["ctrl+l"],
+            "keyboard": "kept-keyboard",
+        });
+        let rendered = on.args(Some(&call)).unwrap();
+        assert!(!rendered.contains(canary), "{rendered}");
+        for kept in ["kept-author", "ctrl+l", "kept-keyboard"] {
+            assert!(rendered.contains(kept), "{rendered}");
+        }
+    }
+
+    #[test]
+    fn env_and_header_values_are_redacted_and_names_kept() {
+        let canary = "env-canary-c05d";
+        let on = Audit::with_sink(Box::new(std::io::sink()), true);
+        let call = json!({
+            "command": "gh pr list",
+            "env": { "GH_PAT": canary, "DATABASE_URL": canary, "N": 3 },
+            "request": {
+                "headers": { "X-Api": canary },
+                "Environment": [["A", canary]],
+            },
+            "list": [{ "headers": [["Authorization", canary]] }],
+        });
+        let rendered = on.args(Some(&call)).unwrap();
+        assert!(!rendered.contains(canary), "{rendered}");
+        let parsed: Value = serde_json::from_str(&rendered).unwrap();
+        let len = format!("<redacted:{} chars>", canary.chars().count());
+        assert_eq!(parsed["command"], "gh pr list");
+        assert_eq!(parsed["env"]["GH_PAT"], json!(len));
+        assert_eq!(parsed["env"]["DATABASE_URL"], json!(len));
+        assert_eq!(parsed["env"]["N"], "<redacted>");
+        assert_eq!(parsed["request"]["headers"]["X-Api"], json!(len));
+        assert_eq!(parsed["request"]["Environment"], "<redacted>");
+        assert_eq!(parsed["list"][0]["headers"], "<redacted>");
     }
 
     #[test]

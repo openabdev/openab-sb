@@ -546,6 +546,11 @@ impl Config {
             if trimmed.is_empty() || trimmed.chars().count() > MAX_REDACT_KEY_CHARS {
                 bail!("audit_redact_keys: {key:?} must be 1-{MAX_REDACT_KEY_CHARS} characters");
             }
+            // Separators are ignored when names are compared, so a name made only
+            // of them would match nothing.
+            if crate::audit::normalise(trimmed).is_empty() {
+                bail!("audit_redact_keys: {key:?} has no letters or digits, so it matches nothing");
+            }
         }
 
         if clients.is_empty() && pty_attach.is_empty() {
@@ -1162,6 +1167,8 @@ mod tests {
         );
         let text = format!("audit_redact_keys = [\" \"]\n{}", base(""));
         assert!(err(&text).contains("audit_redact_keys"));
+        let text = format!("audit_redact_keys = [\"_-.\"]\n{}", base(""));
+        assert!(err(&text).contains("matches nothing"));
     }
 
     #[test]
