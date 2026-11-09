@@ -2,7 +2,9 @@
 //! never logged (they pass through, they do not land); only their size.
 //!
 //! The file is created `0600`: with `audit_args` on, lines can hold text typed
-//! through `key`, which may be a password. Authentication failures come from
+//! through `key`, which may be a password. A top-level `value` argument (the
+//! text `ui_action` `set_value` writes, possibly into a password field) is
+//! always replaced with [`REDACTED`] before it is recorded. Authentication failures come from
 //! unauthenticated callers, so they are rate-limited: a flood costs a summary
 //! line, not the disk.
 
@@ -15,6 +17,10 @@ use std::time::{Duration, Instant};
 
 /// Longest rendering of call arguments kept in an audit line.
 pub const MAX_AUDIT_ARGS_CHARS: usize = 512;
+/// Replaces the top-level `value` argument in an audit line.
+pub const REDACTED: &str = "<redacted>";
+/// Top-level argument names whose content is never recorded.
+const REDACTED_ARGS: &[&str] = &["value"];
 /// Authentication-failure lines written per window; the rest are counted.
 pub const AUTH_FAILURES_PER_WINDOW: u32 = 20;
 pub const AUTH_FAILURE_WINDOW: Duration = Duration::from_secs(60);
@@ -120,7 +126,10 @@ impl Audit {
         if !self.log_args {
             return None;
         }
-        let text = arguments.map(Value::to_string).unwrap_or_default();
+        let text = arguments
+            .map(redact)
+            .map(|a| a.to_string())
+            .unwrap_or_default();
         if text.chars().count() <= MAX_AUDIT_ARGS_CHARS {
             Some(text)
         } else {
@@ -128,6 +137,20 @@ impl Audit {
             Some(format!("{cut}…"))
         }
     }
+}
+
+/// Copy of `arguments` with every [`REDACTED_ARGS`] field replaced, so the
+/// rest of the call (`snapshot_id`, `ref`, `action`) stays in the trail.
+fn redact(arguments: &Value) -> Value {
+    let mut copy = arguments.clone();
+    if let Some(map) = copy.as_object_mut() {
+        for name in REDACTED_ARGS {
+            if let Some(field) = map.get_mut(*name) {
+                *field = Value::String(REDACTED.to_owned());
+            }
+        }
+    }
+    copy
 }
 
 #[cfg(test)]
@@ -180,6 +203,27 @@ mod tests {
         let long = json!({ "text": "x".repeat(2000) });
         let rendered = on.args(Some(&long)).unwrap();
         assert_eq!(rendered.chars().count(), MAX_AUDIT_ARGS_CHARS + 1);
+    }
+
+    #[test]
+    fn ui_action_value_is_redacted() {
+        let canary = "hunter2-canary-6f1d";
+        let on = Audit::with_sink(Box::new(std::io::sink()), true);
+        let call = json!({
+            "snapshot_id": "s1", "ref": "e7", "action": "set_value", "value": canary,
+        });
+        let rendered = on.args(Some(&call)).unwrap();
+        assert!(!rendered.contains(canary), "{rendered}");
+        let parsed: Value = serde_json::from_str(&rendered).unwrap();
+        assert_eq!(parsed["value"], REDACTED);
+        assert_eq!(parsed["snapshot_id"], "s1");
+        assert_eq!(parsed["ref"], "e7");
+        assert_eq!(parsed["action"], "set_value");
+        // Non-string values are redacted too; calls without `value` are unchanged.
+        let number = on.args(Some(&json!({ "value": 42 }))).unwrap();
+        assert_eq!(number, format!("{{\"value\":\"{REDACTED}\"}}"));
+        let plain = on.args(Some(&json!({ "action": "press" }))).unwrap();
+        assert_eq!(plain, r#"{"action":"press"}"#);
     }
 
     #[cfg(unix)]

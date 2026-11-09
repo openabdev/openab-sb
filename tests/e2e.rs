@@ -188,8 +188,12 @@ struct Sb {
 }
 
 async fn start_with(text: &str) -> Sb {
+    start_with_audit(text, Audit::null()).await
+}
+
+async fn start_with_audit(text: &str, audit: Audit) -> Sb {
     let config = Config::parse(text).expect("test config");
-    let app = App::new(&config, Audit::null());
+    let app = App::new(&config, audit);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let router = app.router();
@@ -691,6 +695,50 @@ async fn allowlist_filters_listing_and_blocks_calls_before_the_vm() {
     assert_eq!(s["attached"], true);
     assert_eq!(s["server"]["name"], "fake-vm");
     assert_eq!(s["computer"], "default");
+}
+
+#[tokio::test]
+async fn ui_action_value_never_reaches_the_audit_file() {
+    let canary = "hunter2-canary-b41c";
+    let path =
+        std::env::temp_dir().join(format!("openab-sb-e2e-audit-{}.jsonl", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    let audit = Audit::open(Some(&path), true).unwrap();
+    let sb = start_with_audit(&config_text("", ""), audit).await;
+    let _vm = fake_vm(sb.addr, VM_SECRET, "fake-vm").await.unwrap();
+    sb.wait_for_vm("fake-vm").await;
+
+    let args = json!({"snapshot_id": "s1", "ref": "e7", "action": "set_value", "value": canary});
+    let allowed = sb
+        .call(PTY_TOKEN, json!(1), "ui_action", args.clone())
+        .await;
+    // The computer still receives the real value; only the audit line is redacted.
+    assert_eq!(
+        allowed["result"]["structuredContent"]["args"]["value"],
+        canary
+    );
+    let denied = sb.call(CONNECT_TOKEN, json!(2), "ui_action", args).await;
+    assert_eq!(denied["result"]["isError"], true);
+
+    let text = std::fs::read_to_string(&path).unwrap();
+    let _ = std::fs::remove_file(&path);
+    assert!(
+        !text.contains(canary),
+        "value leaked into the audit file: {text}"
+    );
+    let calls: Vec<Value> = text
+        .lines()
+        .map(|l| serde_json::from_str::<Value>(l).unwrap())
+        .filter(|l| l["event"] == "call" && l["tool"] == "ui_action")
+        .collect();
+    assert_eq!(calls.len(), 2, "{text}");
+    for line in calls {
+        let recorded: Value = serde_json::from_str(line["args"].as_str().unwrap()).unwrap();
+        assert_eq!(recorded["value"], "<redacted>");
+        assert_eq!(recorded["action"], "set_value");
+        assert_eq!(recorded["ref"], "e7");
+        assert_eq!(recorded["snapshot_id"], "s1");
+    }
 }
 
 #[tokio::test]

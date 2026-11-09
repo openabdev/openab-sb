@@ -15,7 +15,8 @@ listen = "127.0.0.1:8790"
 max_inflight = 8
 
 # Audit log: JSON lines. Omit for stdout. `audit_args = false` drops call arguments
-# (e.g. text typed with `key`) from the log.
+# (e.g. text typed with `key`) from the log. A top-level `value` argument (text
+# written by `ui_action` `set_value`) is always recorded as "<redacted>".
 # audit_path = "~/.local/state/openab-sb/audit.jsonl"
 audit_args = true
 

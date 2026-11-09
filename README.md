@@ -263,7 +263,9 @@ The "computer can be thrown away" boundary above does not hold for a **private b
 profile is the whole point of that use, so the agent can act as every account the profile is signed
 in to. Give it a dedicated profile, keep the allowlist to the browser tools you need, and remember
 that `screenshot` captures the whole desktop, not only the browser. Do not run `audit_args = true`
-if typed text may include secrets.
+if typed text may include secrets. The `value` argument (what `ui_action` `set_value` writes,
+possibly into a password field) is always recorded as `"<redacted>"`; text sent through `key`
+is not.
 
 Tool output flows to callers unchanged. Screenshots and shell output from a computer that
 browses the web can carry prompt injection, so callers should treat that output as untrusted.
