@@ -120,7 +120,8 @@ async fn serve(path: PathBuf) -> Result<()> {
     let _ = rustls::crypto::ring::default_provider().install_default();
     let config = Config::load(&path)?;
     let audit = Audit::open(config.audit_path.as_deref(), config.audit_args)
-        .context("opening the audit log")?;
+        .context("opening the audit log")?
+        .with_redact_keys(&config.audit_redact_keys);
     let app = App::new(&config, audit);
     let listener = tokio::net::TcpListener::bind(config.listen)
         .await
@@ -159,7 +160,8 @@ async fn serve(path: PathBuf) -> Result<()> {
                         app.reload_auth(auth, &fresh.pty_attach);
                         tracing::info!(
                             "clients, computers, in-flight limits and pty-attach policies \
-                             reloaded (listen, timeouts and the attach urls need a restart)"
+                             reloaded (listen, timeouts, audit settings and the attach urls need a \
+                             restart)"
                         );
                     }
                     Err(error) => {

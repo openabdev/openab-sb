@@ -188,11 +188,18 @@ struct Sb {
 }
 
 async fn start_with(text: &str) -> Sb {
-    start_with_audit(text, Audit::null()).await
+    start_audited(text, None).await
 }
 
-async fn start_with_audit(text: &str, audit: Audit) -> Sb {
+/// With `Some(path)`, a real audit file opened the way `serve` opens it.
+async fn start_audited(text: &str, audit_path: Option<&std::path::Path>) -> Sb {
     let config = Config::parse(text).expect("test config");
+    let audit = match audit_path {
+        Some(path) => Audit::open(Some(path), config.audit_args)
+            .unwrap()
+            .with_redact_keys(&config.audit_redact_keys),
+        None => Audit::null(),
+    };
     let app = App::new(&config, audit);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -697,48 +704,86 @@ async fn allowlist_filters_listing_and_blocks_calls_before_the_vm() {
     assert_eq!(s["computer"], "default");
 }
 
+/// A secret sent as a call argument must never reach the audit file: not from
+/// `ui_action` `set_value`, not from typed text, not nested in a form, not under
+/// an operator-added name, not on a denied call, and not from the response (the
+/// fake computer echoes its arguments back).
 #[tokio::test]
-async fn ui_action_value_never_reaches_the_audit_file() {
+async fn secret_arguments_never_reach_the_audit_file() {
     let canary = "hunter2-canary-b41c";
     let path =
         std::env::temp_dir().join(format!("openab-sb-e2e-audit-{}.jsonl", std::process::id()));
     let _ = std::fs::remove_file(&path);
-    let audit = Audit::open(Some(&path), true).unwrap();
-    let sb = start_with_audit(&config_text("", ""), audit).await;
+    let text = config_text("audit_args = true\naudit_redact_keys = [\"otp_code\"]", "");
+    let sb = start_audited(&text, Some(&path)).await;
     let _vm = fake_vm(sb.addr, VM_SECRET, "fake-vm").await.unwrap();
     sb.wait_for_vm("fake-vm").await;
 
-    let args = json!({"snapshot_id": "s1", "ref": "e7", "action": "set_value", "value": canary});
-    let allowed = sb
-        .call(PTY_TOKEN, json!(1), "ui_action", args.clone())
+    let set_value =
+        json!({"snapshot_id": "s1", "ref": "e7", "action": "set_value", "value": canary});
+    let calls = [
+        ("ui_action", set_value.clone()),
+        ("key", json!({"action": "type", "text": canary})),
+        (
+            "browser_fill_form",
+            json!({"fields": [{"name": "Password", "ref": "e3", "value": canary}]}),
+        ),
+        (
+            "login",
+            json!({"user": "me", "auth": {"api_token": canary}}),
+        ),
+        ("mfa", json!({"otp_code": canary})),
+    ];
+    for (i, (tool, args)) in calls.iter().enumerate() {
+        let reply = sb.call(PTY_TOKEN, json!(i), tool, args.clone()).await;
+        // The computer still receives the real arguments; only the audit copy changes.
+        assert_eq!(
+            &reply["result"]["structuredContent"]["args"], args,
+            "{tool}"
+        );
+    }
+    let denied = sb
+        .call(CONNECT_TOKEN, json!(99), "ui_action", set_value)
         .await;
-    // The computer still receives the real value; only the audit line is redacted.
-    assert_eq!(
-        allowed["result"]["structuredContent"]["args"]["value"],
-        canary
-    );
-    let denied = sb.call(CONNECT_TOKEN, json!(2), "ui_action", args).await;
     assert_eq!(denied["result"]["isError"], true);
 
     let text = std::fs::read_to_string(&path).unwrap();
     let _ = std::fs::remove_file(&path);
     assert!(
         !text.contains(canary),
-        "value leaked into the audit file: {text}"
+        "a secret leaked into the audit file: {text}"
     );
-    let calls: Vec<Value> = text
+    let lines: Vec<Value> = text
         .lines()
         .map(|l| serde_json::from_str::<Value>(l).unwrap())
-        .filter(|l| l["event"] == "call" && l["tool"] == "ui_action")
+        .filter(|l| l["event"] == "call")
         .collect();
-    assert_eq!(calls.len(), 2, "{text}");
-    for line in calls {
+    assert_eq!(lines.len(), calls.len() + 1, "{text}");
+    let marker = format!("<redacted:{} chars>", canary.chars().count());
+    for line in lines.iter().filter(|l| l["tool"] == "ui_action") {
+        // Who, where, what and how it went stay in the trail.
+        assert!(line["principal"].is_string() && line["outcome"].is_string());
+        assert_eq!(line["computer"], "default");
+        assert!(line["ms"].is_u64() && line["response_bytes"].is_u64());
         let recorded: Value = serde_json::from_str(line["args"].as_str().unwrap()).unwrap();
-        assert_eq!(recorded["value"], "<redacted>");
+        assert_eq!(recorded["value"], json!(marker));
         assert_eq!(recorded["action"], "set_value");
         assert_eq!(recorded["ref"], "e7");
         assert_eq!(recorded["snapshot_id"], "s1");
     }
+    let outcomes: Vec<&str> = lines
+        .iter()
+        .filter(|l| l["tool"] == "ui_action")
+        .map(|l| l["outcome"].as_str().unwrap())
+        .collect();
+    assert_eq!(outcomes, vec!["ok", "denied"]);
+    let form = lines
+        .iter()
+        .find(|l| l["tool"] == "browser_fill_form")
+        .unwrap();
+    let recorded: Value = serde_json::from_str(form["args"].as_str().unwrap()).unwrap();
+    assert_eq!(recorded["fields"][0]["name"], "Password");
+    assert_eq!(recorded["fields"][0]["value"], json!(marker));
 }
 
 #[tokio::test]

@@ -15,10 +15,12 @@ listen = "127.0.0.1:8790"
 max_inflight = 8
 
 # Audit log: JSON lines. Omit for stdout. `audit_args = false` drops call arguments
-# (e.g. text typed with `key`) from the log. A top-level `value` argument (text
-# written by `ui_action` `set_value`) is always recorded as "<redacted>".
+# from the log. With it on, secret-bearing arguments (`value`, `text`, and any name
+# containing password/secret/token/…, at any depth) are recorded as
+# "<redacted:N chars>". `audit_redact_keys` adds exact names; the defaults stay.
 # audit_path = "~/.local/state/openab-sb/audit.jsonl"
 audit_args = true
+# audit_redact_keys = ["otp_code"]
 
 # Each computer dials `GET /vm/attach` with its own secret. The secret alone
 # selects the slot; the name here is the label used in routes, policy and audit,
