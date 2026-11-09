@@ -27,6 +27,8 @@ pub const MAX_TIMEOUT_SECS: u64 = 600;
 pub const DEFAULT_COMPUTER: &str = "default";
 /// `computers` key meaning "every computer, including ones configured later".
 pub const ANY_COMPUTER: &str = "*";
+/// Longest name accepted in `audit_redact_keys`.
+pub const MAX_REDACT_KEY_CHARS: usize = 128;
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -38,6 +40,9 @@ struct RawConfig {
     #[serde(default = "default_true")]
     audit_args: bool,
     audit_path: Option<String>,
+    /// Extra argument names to redact, on top of the built-in set.
+    #[serde(default)]
+    audit_redact_keys: Vec<String>,
     /// v1: one computer, named [`DEFAULT_COMPUTER`].
     vm: Option<RawVm>,
     #[serde(default, rename = "computer")]
@@ -318,6 +323,8 @@ pub struct Config {
     pub max_inflight: usize,
     pub audit_args: bool,
     pub audit_path: Option<PathBuf>,
+    /// Added to the audit's built-in redaction set; never replaces it.
+    pub audit_redact_keys: Vec<String>,
     pub timeouts: Timeouts,
     pub auth: Auth,
     pub pty_attach: Vec<PtyAttach>,
@@ -534,6 +541,18 @@ impl Config {
             });
         }
 
+        for key in &raw.audit_redact_keys {
+            let trimmed = key.trim();
+            if trimmed.is_empty() || trimmed.chars().count() > MAX_REDACT_KEY_CHARS {
+                bail!("audit_redact_keys: {key:?} must be 1-{MAX_REDACT_KEY_CHARS} characters");
+            }
+            // Separators are ignored when names are compared, so a name made only
+            // of them would match nothing.
+            if crate::audit::normalise(trimmed).is_empty() {
+                bail!("audit_redact_keys: {key:?} has no letters or digits, so it matches nothing");
+            }
+        }
+
         if clients.is_empty() && pty_attach.is_empty() {
             bail!("no [[client]] and no [[pty_attach]]: nothing could ever call a computer");
         }
@@ -543,6 +562,7 @@ impl Config {
             max_inflight,
             audit_args: raw.audit_args,
             audit_path: raw.audit_path.as_deref().map(expand_home),
+            audit_redact_keys: raw.audit_redact_keys,
             timeouts,
             auth: Auth { computers, clients },
             pty_attach,
@@ -1132,6 +1152,23 @@ mod tests {
         assert_eq!(c.timeouts.for_tool("bash"), Duration::from_secs(60));
         assert!(c.unused_computers().is_empty());
         assert_eq!(c.wildcard_clients(), vec!["agent"]);
+    }
+
+    #[test]
+    fn audit_redact_keys_are_read_and_checked() {
+        assert!(Config::parse(&base(""))
+            .unwrap()
+            .audit_redact_keys
+            .is_empty());
+        let text = format!("audit_redact_keys = [\"otp_code\"]\n{}", base(""));
+        assert_eq!(
+            Config::parse(&text).unwrap().audit_redact_keys,
+            vec!["otp_code"]
+        );
+        let text = format!("audit_redact_keys = [\" \"]\n{}", base(""));
+        assert!(err(&text).contains("audit_redact_keys"));
+        let text = format!("audit_redact_keys = [\"_-.\"]\n{}", base(""));
+        assert!(err(&text).contains("matches nothing"));
     }
 
     #[test]
