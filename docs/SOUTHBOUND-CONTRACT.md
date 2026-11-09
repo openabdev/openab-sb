@@ -130,6 +130,14 @@ Same argument names as `oab-instance-mcp`, so agents that know one know the othe
   text, `isError: true` on non-zero exit. This is an **unrestricted shell**: whoever the
   switchboard lets call it owns the VM.
 
+### Secret arguments
+
+A switchboard with `audit_args` on records call arguments, but replaces any argument named
+`value` or `text`, or whose name contains `password`, `secret`, `token` (and a few more; see
+the README's "Audit redaction"). If a tool of yours takes a secret, name the argument so,
+for example `value` or `password`, not `data` or `input`. Never echo a secret back in a
+result or error text either: results reach the caller unchanged.
+
 ### Errors
 
 A tool that ran and failed → a normal result with `isError: true` and a text explanation.

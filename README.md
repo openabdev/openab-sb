@@ -172,7 +172,7 @@ may use.
 | limits | per computer `max_inflight` (default 8), plus a per-caller share of it — `[[client]].max_inflight` / `[[pty_attach]].max_inflight`, default half the live socket's limit rounded up — so one caller cannot occupy a shared computer. Per-tool timeouts (`screenshot` 10 s, default 60 s); 16 MiB frames from a computer |
 | failures | `-32001` computer offline (returned as a tool error so clients keep the server), `-32002` over a cap, `-32003` timed out, `-32004` disconnected mid-call. Nothing is retried |
 | state | memory only. A restart fails every in-flight call |
-| audit | JSON lines, file mode `0600`: attach, detach, takeover, rename, auth failures (capped at 20 a minute, the rest summarised), and every `tools/call` with caller, computer, tool, outcome, latency, size, and (optionally) arguments. Results are never logged |
+| audit | JSON lines, file mode `0600`: attach, detach, takeover, rename, auth failures (capped at 20 a minute, the rest summarised), and every `tools/call` with caller, computer, tool, outcome, latency, size, and (optionally) arguments with secret-bearing ones redacted (see [Audit redaction](#audit-redaction)). Results and error messages are never logged, only their size and JSON-RPC code |
 | PTY attach | redials with backoff on drops, on `4006` (pod replaced) and on proxy errors such as `502`; a `401`/`403`/`429` refusal waits a minute for a fresh grant; stops on every other `4xxx`, per openab-pty §9.2. At most 64 requests from one pod are handled at once, and the attach's own `max_inflight` applies on top |
 
 ### Reload (`SIGHUP`)
@@ -187,9 +187,37 @@ may use.
 | Per-caller `max_inflight` | from that caller's next call |
 | A `[[pty_attach]]`'s `computer`, `tools` or `max_inflight` | swapped on the running attach, from its next request, so a renamed computer keeps serving that pod |
 | `[[pty_attach]]` added or removed, or its `url` or `secret_file`, `listen`, timeouts | need a restart; each is logged at `warn` on reload |
+| `audit_path`, `audit_args`, `audit_redact_keys` | need a restart |
 
 The computer table is swapped before client auth, so a daemon presenting a newly added
 secret is never refused with `4003` — which would tell it to stop.
+
+### Audit redaction
+
+With `audit_args = true` (the default) each `call` line carries the call's arguments, at most
+512 characters. Before they are written, every argument whose name is secret-bearing is
+replaced, at any depth and inside arrays: a string becomes `"<redacted:N chars>"`, anything
+else (a number, an object, a list) becomes `"<redacted>"`. Only the audit copy changes; the
+computer receives the real arguments.
+
+Names are compared case-insensitively and ignoring `-` and `_`, so `privateKey`,
+`private_key` and `Private-Key` are the same name. Redacted by default:
+
+- exactly `value`, `values`, `text`, `password`, `passphrase`, `secret`, `token`, `pin`,
+  `otp`, `pwd`. This covers `ui_action` `set_value` (which may fill a password field), `key`
+  `type`, and browser typing and form-filling tools;
+- any name containing `password`, `passwd`, `passphrase`, `secret`, `token`, `api_key`,
+  `apikey`, `credential`, `cookie`, `authorization`, `private_key` or `access_key`.
+
+`audit_redact_keys = ["otp_code", "card_number"]` adds exact names. It cannot remove a
+default; to record no arguments at all, set `audit_args = false`. A change to any of these
+settings needs a restart; a `SIGHUP` that sees one logs a warning. Free-form arguments are
+not inspected: a password inside a `bash` `command`, a token in a `url` query string or
+`user:pass@` part, or keys sent with `key` `press`, is still recorded. Turn `audit_args` off when callers may do that.
+
+Upgrading does not rewrite an existing audit file. If a switchboard before this change ran
+with `audit_args = true` and callers may have sent secrets (`ui_action` `set_value`, `key`
+`type`), rotate those secrets and rotate or delete the old `audit.jsonl`.
 
 ## Run
 
@@ -262,8 +290,10 @@ uses it.
 The "computer can be thrown away" boundary above does not hold for a **private browser**. A signed-in
 profile is the whole point of that use, so the agent can act as every account the profile is signed
 in to. Give it a dedicated profile, keep the allowlist to the browser tools you need, and remember
-that `screenshot` captures the whole desktop, not only the browser. Do not run `audit_args = true`
-if typed text may include secrets.
+that `screenshot` captures the whole desktop, not only the browser. Typed text and filled-in
+values are redacted from the audit (see [Audit redaction](#audit-redaction)); a secret inside
+a free-form argument such as a `bash` command is not, so turn `audit_args` off if callers may
+send one.
 
 Tool output flows to callers unchanged. Screenshots and shell output from a computer that
 browses the web can carry prompt injection, so callers should treat that output as untrusted.

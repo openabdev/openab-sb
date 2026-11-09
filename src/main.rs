@@ -120,7 +120,8 @@ async fn serve(path: PathBuf) -> Result<()> {
     let _ = rustls::crypto::ring::default_provider().install_default();
     let config = Config::load(&path)?;
     let audit = Audit::open(config.audit_path.as_deref(), config.audit_args)
-        .context("opening the audit log")?;
+        .context("opening the audit log")?
+        .with_redact_keys(&config.audit_redact_keys);
     let app = App::new(&config, audit);
     let listener = tokio::net::TcpListener::bind(config.listen)
         .await
@@ -147,6 +148,11 @@ async fn serve(path: PathBuf) -> Result<()> {
     {
         let app = app.clone();
         let path = path.clone();
+        let running_audit = (
+            config.audit_path.clone(),
+            config.audit_args,
+            config.audit_redact_keys.clone(),
+        );
         tokio::spawn(async move {
             use tokio::signal::unix::{signal, SignalKind};
             let Ok(mut hup) = signal(SignalKind::hangup()) else {
@@ -155,11 +161,23 @@ async fn serve(path: PathBuf) -> Result<()> {
             while hup.recv().await.is_some() {
                 match Config::load(&path) {
                     Ok(fresh) => {
+                        let reloaded_audit = (
+                            fresh.audit_path.clone(),
+                            fresh.audit_args,
+                            fresh.audit_redact_keys.clone(),
+                        );
+                        if reloaded_audit != running_audit {
+                            tracing::warn!(
+                                "audit_path, audit_args or audit_redact_keys changed; the running \
+                                 audit keeps its old settings until a restart"
+                            );
+                        }
                         let auth = fresh.auth;
                         app.reload_auth(auth, &fresh.pty_attach);
                         tracing::info!(
                             "clients, computers, in-flight limits and pty-attach policies \
-                             reloaded (listen, timeouts and the attach urls need a restart)"
+                             reloaded (listen, timeouts, audit settings and the attach urls need a \
+                             restart)"
                         );
                     }
                     Err(error) => {
