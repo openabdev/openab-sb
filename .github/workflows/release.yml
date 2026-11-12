@@ -99,13 +99,14 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          NOTE="Container image: ghcr.io/openabdev/openab-sb:${GITHUB_REF_NAME#v} is pushed after this release is created. A new GHCR package is private by default. Set it to Public once under Package settings before anonymous docker pull works. Stable tags also move :latest."
           gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" \
-            --title "openab-sb ${GITHUB_REF_NAME#v}" --generate-notes \
+            --title "openab-sb ${GITHUB_REF_NAME#v}" --generate-notes --notes "$NOTE" \
             dist/openab-sb-*.tar.gz dist/SHA256SUMS
 
   image:
     name: container image (ghcr.io)
-    needs: build
+    needs: [build, publish]
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     permissions:
@@ -130,6 +131,12 @@ jobs:
           done
           image-bin/amd64/openab-sb --version
       - uses: docker/setup-qemu-action@v3
+      - name: Run the arm64 binary under emulation
+        run: |
+          set -euo pipefail
+          docker run --rm --platform linux/arm64 \
+            -v "$PWD/image-bin/arm64/openab-sb:/tmp/openab-sb:ro" \
+            debian:bookworm-slim /tmp/openab-sb --version
       - uses: docker/setup-buildx-action@v3
       - uses: docker/login-action@v3
         with:

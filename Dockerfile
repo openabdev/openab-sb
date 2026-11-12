@@ -5,7 +5,7 @@
 # this file as the Dockerfile.
 #
 # The config is not baked in. Mount it at /etc/openab-sb/openab-sb.toml. It
-# must set listen = "127.0.0.1:8796" and an audit_path under /var/lib/openab-sb.
+# must set listen = "127.0.0.1:8790" and an audit_path under /var/lib/openab-sb.
 # The switchboard binds loopback, so only processes in the same pod (the
 # tailscale sidecar) can reach it.
 #
