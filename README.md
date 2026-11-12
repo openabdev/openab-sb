@@ -253,6 +253,23 @@ cp openab-sb.toml.example openab-sb.toml        # paste the verifiers
 Adding a computer later is an operator action — generate a pair, add the verifier, `SIGHUP`.
 There is no self-registration.
 
+### Container image
+
+Each `v*` tag publishes a multi-arch (amd64, arm64) image to GHCR:
+
+```bash
+docker pull ghcr.io/openabdev/openab-sb:0.2.2     # also :0.2
+```
+
+The image is `debian:bookworm-slim` with the release's static `openab-sb` binary, `curl` and
+`ca-certificates`. It runs as a non-root user, and its entrypoint is
+`openab-sb serve -c /etc/openab-sb/openab-sb.toml`. The config is not baked in: mount it at that
+path. It must set `listen = "127.0.0.1:8796"` and an `audit_path` under `/var/lib/openab-sb`,
+which the image creates and owns for the audit file.
+
+A pod can probe the switchboard with `curl -fsS http://127.0.0.1:8796/healthz` from inside the
+container. Keep the listener on loopback, and put TLS in a sidecar such as `tailscale serve`.
+
 The switchboard binds loopback and refuses anything else unless you set
 `allow_insecure_bind = true`. Put TLS in front of it:
 
