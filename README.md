@@ -253,6 +253,29 @@ cp openab-sb.toml.example openab-sb.toml        # paste the verifiers
 Adding a computer later is an operator action — generate a pair, add the verifier, `SIGHUP`.
 There is no self-registration.
 
+### Container image
+
+Each `v*` tag publishes a multi-arch (amd64, arm64) image to GHCR. The image job runs only after
+the GitHub Release for the tag has been created. A stable tag (no prerelease suffix) also moves
+`:latest`. A prerelease tag does not.
+
+```bash
+docker pull ghcr.io/openabdev/openab-sb:0.2.2     # also :0.2 and :latest
+```
+
+A new GHCR package starts private, so anonymous `docker pull` fails until someone sets it to
+Public once: open the `openab-sb` package under the openabdev org, then Package settings, then
+Change visibility to Public. Authenticated pulls work before that change.
+
+The image is `debian:bookworm-slim` with the release's static `openab-sb` binary, `curl` and
+`ca-certificates`. It runs as the non-root user `openab-sb` (UID and GID 10001), and its entrypoint is
+`openab-sb serve -c /etc/openab-sb/openab-sb.toml`. The config is not baked in: mount it at that
+path. It must set `listen = "127.0.0.1:8790"` and an `audit_path` under `/var/lib/openab-sb`,
+which the image creates and owns for the audit file.
+
+A pod can probe the switchboard with `curl -fsS --max-time 2 http://127.0.0.1:8790/healthz` from inside the
+container. Keep the listener on loopback, and put TLS in a sidecar such as `tailscale serve`.
+
 The switchboard binds loopback and refuses anything else unless you set
 `allow_insecure_bind = true`. Put TLS in front of it:
 
