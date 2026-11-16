@@ -186,9 +186,10 @@ may use.
 | `max_inflight`, global or per computer | reloaded, and applied to that computer's next attach. A live socket keeps the value it attached with |
 | Per-caller `max_inflight` | from that caller's next call |
 | A `[[pty_attach]]`'s `computer`, `tools` or `max_inflight` | swapped on the running attach, from its next request, so a renamed computer keeps serving that pod |
+| `[[pty_attach]].allow_insecure_transport` | takes effect only at startup. A reload reads it only to validate the `url` (a non-loopback `ws://` without it is refused), so an invalid pair rejects the whole reload |
 | `[[pty_attach]]` added or removed, or its `url` or `secret_file` changed | need a restart; each is logged at `warn` on reload (a removed block keeps dialling under its old policy) |
 | `listen`, `[timeouts]` | need a restart; the reload log line names them, and nothing else warns |
-| `allow_insecure_bind` | only read at startup. A reload whose `listen` and `allow_insecure_bind` would not pass `check` (a non-loopback `listen` without it) is rejected whole, like any invalid file |
+| `allow_insecure_bind` | takes effect only at startup (a reload reads it only to validate `listen`). A reload whose `listen` and `allow_insecure_bind` would not pass `check` (a non-loopback `listen` without it) is rejected whole, like any invalid file |
 | `audit_path`, `audit_args`, `audit_redact_keys` | need a restart; a reload that sees a change logs a `warn` |
 
 A reload re-reads and validates the whole file. If it does not validate, the error is logged
@@ -276,10 +277,10 @@ the GitHub Release for the tag has been created. A stable tag (no prerelease suf
 docker pull ghcr.io/openabdev/openab-sb:0.3.0     # also :0.3 and :latest
 ```
 
-The tags are the full version (`0.3.0`) and `major.minor` (`0.3`). The package must be public for
-an anonymous `docker pull` (and an unauthenticated image pull in a cluster) to work. A new GHCR
-package starts private, so the release notes ask the maintainer to set it to Public once (package
-settings, Change visibility). Authenticated pulls work before that change.
+The tags are the full version (`0.3.0`) and `major.minor` (`0.3`). v0.3.0 is the first release that
+publishes the image automatically on a `v*` tag; earlier releases have no image. The GHCR package is
+public, so `docker pull` and an unauthenticated image pull in a cluster work without credentials.
+(A new GHCR package starts private, and the release notes ask the maintainer to set it to Public once.)
 
 The image is `debian:bookworm-slim` with the release's static `openab-sb` binary, `curl` and
 `ca-certificates`. It runs as the non-root user `openab-sb` (UID and GID 10001), and its entrypoint is
@@ -391,7 +392,7 @@ sequenceDiagram
     participant C as Client
     participant F as HTTPS front
     participant S as openab-sb
-    participant M as Computer
+    participant M as Mac computer
     Note over C,M: No computer attached yet
     C->>F: GET /readyz/mac-1 with a client token
     F->>S: forwarded to 127.0.0.1:8790
@@ -401,7 +402,7 @@ sequenceDiagram
     F->>S: forwarded
     S-->>F: tool result with isError, the VM is not connected
     F-->>C: tool result with isError
-    M->>F: dial wss /vm/attach with its secret
+    M->>F: dial wss /vm/attach over WSS with its secret
     F->>S: WebSocket upgrade
     S->>M: initialize
     M-->>S: initialize result
@@ -453,7 +454,7 @@ URL names, so moving a computer is a change of its configured URL.
 ```mermaid
 flowchart TD
     old["Old install<br/>host service and its HTTPS front"]
-    new["New pod<br/>https://#lt;name#gt;.#lt;tailnet#gt;.ts.net"]
+    new["Connect-deployed switchboard pod<br/>https://#lt;name#gt;.#lt;tailnet#gt;.ts.net"]
     s1["Step 1: Deploy the pod beside the old install<br/>with the imported config"]
     s2["Step 2: Check the new front<br/>healthz is 200, readyz is 503 vm offline"]
     s3["Step 3: Repoint each computer to the new wss URL<br/>and restart its agent"]

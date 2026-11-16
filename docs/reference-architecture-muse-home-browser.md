@@ -299,7 +299,7 @@ permissions there even if policy allowed them.
 | Persistent profile | A site the profile is signed in to loaded its signed-in interface, with no login wall or captcha. No account details were recorded |
 | Latency | list-tools 0.8 to 1.1 s; `sys_info` 1.1 s; `browser_navigate` 2.7 s (IP-echo), 10.9 s (signed-in site); first manual `initialize` through the proxy 17 s. Nothing over 45 s |
 
-The Mac mini's own egress, looked up separately by the operator, is the same network: a consumer ISP. So the browser call leaves from the Mac mini's network, and that
+The computer's own egress, looked up separately by the operator, is the same network: a consumer ISP. So the browser call leaves from the computer's network, and that
 network is consumer ISP egress rather than a cloud or datacenter one. An ASN and organisation do not
 prove a connection is residential in the strictest sense.
 
