@@ -28,10 +28,10 @@ audit_args = true
 # selects the slot; the name here is the label used in routes, policy and audit,
 # and it attests possession of that secret, not a particular machine.
 # Names are 1-64 chars of [A-Za-z0-9_-] — no `.`, because a bare TOML key such as
-# `rpi1.local` is a dotted key. Renaming a computer without changing its secret
+# `host.local` is a dotted key. Renaming a computer without changing its secret
 # relabels the live socket and closes nothing.
 [[computer]]
-name = "macmini"
+name = "mac-1"
 secret_sha256 = "sha256:REPLACE_ME"
 
 [[computer]]
@@ -54,8 +54,8 @@ bash = 60
 [[client]]
 name = "connect"
 token_sha256 = "sha256:REPLACE_ME"
-default_computer = "macmini"
-computers = { macmini = ["sys_info", "screenshot", "mouse", "key"], muse-vm = ["sys_info"] }
+default_computer = "mac-1"
+computers = { mac-1 = ["sys_info", "screenshot", "mouse", "key"], muse-vm = ["sys_info"] }
 
 # `"*"` is every computer, including ones configured later: for the owner only.
 # It cannot be mixed with names, and it still needs `default_computer` so that
@@ -63,7 +63,7 @@ computers = { macmini = ["sys_info", "screenshot", "mouse", "key"], muse-vm = ["
 [[client]]
 name = "agent"
 token_sha256 = "sha256:REPLACE_ME"
-default_computer = "macmini"
+default_computer = "mac-1"
 computers = { "*" = ["*"] }
 # max_inflight = 4   # this caller's share of one computer; default is half of
 #                    # the computer's max_inflight, rounded up

@@ -1,6 +1,6 @@
 # ADR: one switchboard, many computers (v2)
 
-Status: proposed · 2026-10-03 · revision 3 (after two reviews) · supersedes the "one VM at a time"
+Status: implemented in v0.2.0 (#7) · 2026-10-03 · revision 3 (after two reviews) · supersedes the "one VM at a time"
 rule of v1
 
 ## Context
@@ -9,8 +9,8 @@ v1 has one slot for the machine with the hands. Whoever attaches last owns it, a
 previous one is closed with `4002` and stops. That was enough to prove the relay, and it
 broke the moment there were two computers:
 
-- macmini (instance-mcp 0.8.0, switchboard mode) holds the slot today. Muse's VM attaching
-  as a second set of hands would evict it, and the macmini daemon would stop by contract.
+- mac-1 (instance-mcp 0.8.0, switchboard mode) holds the slot today. Muse's VM attaching
+  as a second set of hands would evict it, and the mac-1 daemon would stop by contract.
 - Testing a second Mac's `wss://` path would do the same.
 - The only workaround is one switchboard per computer, each with its own port,
   `tailscale serve` entry and tokens, and for Muse its own per-address approval.
@@ -33,7 +33,7 @@ natural place for that list, since every computer already dials it.
 max_inflight = 8            # default for every computer (unchanged from v1)
 
 [[computer]]
-name = "macmini"
+name = "mac-1"
 secret_sha256 = "sha256:…"
 
 [[computer]]
@@ -61,7 +61,7 @@ max_inflight = 4            # optional override
 Config rules, all enforced by `check` and at load:
 
 - Computer names are 1–64 characters of `[A-Za-z0-9_-]`. **`.` is not allowed**, because a
-  bare TOML key `rpi1.local` is a dotted key that makes a nested table. v1 names (`.` allowed,
+  bare TOML key `host.local` is a dotted key that makes a nested table. v1 names (`.` allowed,
   `config.rs:332`) keep their rule for clients and pty attaches.
 - Verifiers are unique across **all** computers and clients. v1 already refuses reuse
   between the VM secret and a client token (`config.rs:244,248`); v2 extends that to every
@@ -75,22 +75,22 @@ Config rules, all enforced by `check` and at load:
   (`main.rs:134`), until every block naming it is edited in the same change.
 - Computer names are a separate namespace from client and pty-attach names, which stay
   unique among themselves as in v1 (`config.rs:240,263`). Audit lines carry `principal` and
-  `computer` as distinct fields, so `macmini` as both a computer and a client name is
+  `computer` as distinct fields, so `mac-1` as both a computer and a client name is
   unambiguous.
 
 ### Callers get access per computer, deny by default
 
 ```toml
 [[client]]
-name = "pahud"
+name = "owner"
 token_sha256 = "sha256:…"
-default_computer = "macmini"                  # required: more than one computer reachable
+default_computer = "mac-1"                  # required: more than one computer reachable
 computers = { "*" = ["*"] }                   # owner: every computer, every tool
 
 [[client]]
 name = "muse"
 token_sha256 = "sha256:…"
-computers = { macmini = ["sys_info", "screenshot", "browser_navigate", "browser_snapshot",
+computers = { mac-1 = ["sys_info", "screenshot", "browser_navigate", "browser_snapshot",
                          "browser_click", "browser_type", "browser_press_key",
                          "browser_wait_for", "browser_tabs", "browser_take_screenshot"] }
 max_inflight = 4                              # optional, see Fairness
@@ -98,8 +98,8 @@ max_inflight = 4                              # optional, see Fairness
 [[client]]
 name = "connect"
 token_sha256 = "sha256:…"
-default_computer = "macmini"
-computers = { macmini = ["sys_info", "screenshot"], muse-vm = ["sys_info"] }
+default_computer = "mac-1"
+computers = { mac-1 = ["sys_info", "screenshot"], muse-vm = ["sys_info"] }
 ```
 
 - **Deny by default.** A computer missing from `computers` does not exist for that caller,
@@ -139,7 +139,7 @@ included.
 - If it can reach more than one (including any `"*"` caller), `default_computer` is
   required and `check` refuses the config without it.
 
-Adding `muse-vm` therefore leaves `pahud`'s `/mcp` pointing at macmini, and Connect or Kiro
+Adding `muse-vm` therefore leaves `owner`'s `/mcp` pointing at mac-1, and Connect or Kiro
 configured on `/mcp` keep working.
 
 Order of checks on every northbound request:
@@ -150,20 +150,20 @@ Order of checks on every northbound request:
    the same `404` with the same body.
 3. Tool policy and forwarding work as in v1.
 
-Why a path per computer rather than namespaced tool names (`macmini__screenshot`) or a
+Why a path per computer rather than namespaced tool names (`mac-1__screenshot`) or a
 `computer` argument on every tool:
 
 - **Tool names stay exact.** Connect matches `sys_info` and `screenshot` by name, and models
   are prompted with instance-mcp's instructions, which name tools unprefixed.
 - **A computer is an MCP server.** MCP clients already hold several servers. Adding
-  "macmini" and "muse-vm" as two servers in Kiro, Connect or a Muse skill is the existing UX.
+  "mac-1" and "muse-vm" as two servers in Kiro, Connect or a Muse skill is the existing UX.
 - **Policy is evaluated once per request** from the path, before any frame is sent.
 
 There is no `list_computers` MCP tool. Pickers (#27, Connect) are HTTP clients and read
 `GET /computers`, and a model on `/mcp/{computer}` could not act on such a list anyway.
 
 `initialize` names the computer in its instructions ("…connected through OpenAB Switchboard
-as `macmini`…"). The always-available tool keeps the name `vm_status` for compatibility and
+as `mac-1`…"). The always-available tool keeps the name `vm_status` for compatibility and
 gains a `computer` field.
 
 ### PTY attach names its computer
@@ -194,7 +194,7 @@ Without `computer` and with more than one computer configured, the config is ref
   computers: 200 ready, 503 offline. Unknown and not-allowed give the same 404 as on
   `/mcp/{computer}`, so a tailnet node without a token (an untagged Muse node included)
   cannot learn which computers exist. Monitoring uses a token scoped to the computers it
-  watches, for example `computers = { macmini = ["vm_status"] }` (a tool list may not be
+  watches, for example `computers = { mac-1 = ["vm_status"] }` (a tool list may not be
   empty, `config.rs:87-89`).
 - `GET /status` (client token) lists only the caller's computers.
   - The socket peer (`hub.rs:243-252`, taken from forwarded identity headers,
@@ -225,7 +225,7 @@ Without `computer` and with more than one computer configured, the config is ref
 
 `max_inflight` counts per socket (`hub.rs:174-180`). Without more, one caller can occupy
 every slot on a shared computer, so a long Muse browsing run would starve Connect's
-screenshot poll on macmini.
+screenshot poll on mac-1.
 
 v2 adds a per-client cap on each computer:
 
@@ -277,10 +277,10 @@ in `/status` and `vm_status` are now shown only to callers granted
 
 - One switchboard, one port, one `tailscale serve` entry and, for Muse, one approved address
   serve every computer.
-- macmini and a Muse VM can both be attached, and neither evicts the other.
-- Muse as a caller keeps its token and URL (`/mcp` defaults to macmini). Muse as a computer
+- mac-1 and a Muse VM can both be attached, and neither evicts the other.
+- Muse as a caller keeps its token and URL (`/mcp` defaults to mac-1). Muse as a computer
   needs a VM secret and a daemon that dials out.
-- Moving macmini's config from `default` to `macmini` is a relabel. The attached instance-mcp
+- Moving mac-1's config from `default` to `mac-1` is a relabel. The attached instance-mcp
   is not closed, which matters because a daemon that gets `4003` stops until someone
   restarts it (instance-mcp `ReverseAttachClient.swift:125`, `sb_daemon.py:35`).
 - Memory and audit grow with the number of computers. The expected scale is single digits.
@@ -350,8 +350,8 @@ in `/status` and `vm_status` are now shown only to callers granted
 4. **`[[pty_attach]].computer`.** End-to-end tests: an attach lends the computer it names and
    not the first one configured; and it keeps serving the pod through a same-verifier rename
    of that computer, which is the reload path a running attach must follow.
-5. **Deploy on macmini.** Swapping the binary is a restart: instance-mcp gets `1001` and
-   redials (`ReverseAttachClient.swift:126`). After that, relabel `default` to `macmini` by
+5. **Deploy on mac-1.** Swapping the binary is a restart: instance-mcp gets `1001` and
+   redials (`ReverseAttachClient.swift:126`). After that, relabel `default` to `mac-1` by
    reload and confirm instance-mcp stays attached through the reload.
 6. **First second computer: Muse's VM.** Open questions for Muse before this step:
    - Can a WebSocket upgrade cross its TCP-only `:3130` HTTP proxy? That needs `CONNECT`, and
