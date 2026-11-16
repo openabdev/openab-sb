@@ -9,7 +9,7 @@ session you already have at home.
 instance — even though the two cannot reach each other:
 
 ```
-Muse (cloud agent)  ──HTTPS + Bearer──►  openab-sb  ◄──WSS (home dials out)──  macmini
+Muse (cloud agent)  ──HTTPS + Bearer──►  openab-sb  ◄──WSS (home dials out)──  mac-1
                                          switchboard                            oab-instance-mcp
                                                                                 + Playwright MCP
                                                                                 + Chromium
@@ -70,12 +70,12 @@ flowchart LR
 
     subgraph edge["Switchboard host (you run it)"]
         front["TLS front<br/>tailscale serve (PoC)<br/>or a public tunnel"]
-        sb["openab-sb<br/>POST /mcp/macmini<br/>allowlist: browser_* only"]
+        sb["openab-sb<br/>POST /mcp/mac-1<br/>allowlist: browser_* only"]
         front --> sb
     end
 
     subgraph home["Home — outbound only"]
-        subgraph mac["macmini (logged-in Aqua session)"]
+        subgraph mac["mac-1 (logged-in Aqua session)"]
             imcp["oab-instance-mcp<br/>--switchboard … --switchboard-profile desktop<br/>--upstream browser=…"]
             pw["Playwright MCP :8794<br/>loopback"]
             chromium["Chromium (headed)<br/>persistent profile"]
@@ -87,7 +87,7 @@ flowchart LR
     grok -- "HTTPS, Bearer" --> front
     dots -- "HTTPS, Bearer" --> front
     duet -- "HTTPS, Bearer" --> front
-    imcp == "WSS /vm/attach<br/>dialled by macmini<br/>Bearer computer secret" ==> front
+    imcp == "WSS /vm/attach<br/>dialled by mac-1<br/>Bearer computer secret" ==> front
 ```
 
 | Piece | Runs on | Job |
@@ -95,15 +95,15 @@ flowchart LR
 | Muse, Grok Bot, OpenAI Dots, Claude Duet | cloud | MCP clients, one `[[client]]` each. Needs to add a remote MCP server by URL with an `Authorization` header |
 | TLS front | switchboard host | Terminates TLS. The PoC uses `tailscale serve` (tailnet only), so Muse must reach the tailnet; a public tunnel such as `cloudflared` is the alternative when it cannot |
 | `openab-sb` | switchboard host | Authenticates, picks the computer from the path, applies the per-caller tool allowlist, relays |
-| `oab-instance-mcp` | macmini | Dials the switchboard, serves tools on that socket under one profile |
-| Playwright MCP | macmini | Loopback MCP server driving the browser (`poc/pw-mcp` in OpenAB Computer) |
-| Chromium | macmini | The browser, with the persistent profile |
+| `oab-instance-mcp` | mac-1 | Dials the switchboard, serves tools on that socket under one profile |
+| Playwright MCP | mac-1 | Loopback MCP server driving the browser (`poc/pw-mcp` in OpenAB Computer) |
+| Chromium | mac-1 | The browser, with the persistent profile |
 
 ## Call flow
 
 1. `oab-instance-mcp` dials `wss://<switchboard>/vm/attach` with the computer secret. The
    switchboard picks the slot from the secret and sends `initialize`.
-2. Muse calls `POST https://<switchboard>/mcp/macmini` with its client token.
+2. Muse calls `POST https://<switchboard>/mcp/mac-1` with its client token.
 3. The switchboard resolves, in order, the token, then the computer, then the tool. A tool
    outside the allowlist is absent from `tools/list` and refused on `tools/call`.
 4. Allowed calls are relayed down the computer's socket. `oab-instance-mcp` filters again by
@@ -118,7 +118,7 @@ the switchboard (`/healthz` is 200).
 ### 1. Switchboard
 
 ```sh
-openab-sb gen-secret     # once for the computer  → secret (macmini) + verifier
+openab-sb gen-secret     # once for the computer  → secret (mac-1) + verifier
 openab-sb gen-secret     # once for the caller    → token  (Muse)    + verifier
 ```
 
@@ -126,14 +126,14 @@ openab-sb gen-secret     # once for the caller    → token  (Muse)    + verifie
 
 ```toml
 [[computer]]
-name = "macmini"
-secret_sha256 = "sha256:…"            # verifier of the macmini secret
+name = "mac-1"
+secret_sha256 = "sha256:…"            # verifier of the mac-1 secret
 
 [[client]]
 name = "muse"
 token_sha256 = "sha256:…"             # verifier of Muse's token
-default_computer = "macmini"
-computers = { macmini = [
+default_computer = "mac-1"
+computers = { mac-1 = [
   "sys_info",
   "browser_navigate", "browser_navigate_back", "browser_snapshot", "browser_find",
   "browser_click", "browser_type", "browser_fill_form", "browser_press_key",
@@ -202,16 +202,16 @@ Client notes (reported by Muse on 2026-10-26, see [Muse results](#muse-results))
 
 ```sh
 # 1. computer attached and ready
-curl -s -H "Authorization: Bearer $MUSE_TOKEN" https://<switchboard>/readyz/macmini -o /dev/null -w '%{http_code}\n'   # 200
+curl -s -H "Authorization: Bearer $MUSE_TOKEN" https://<switchboard>/readyz/mac-1 -o /dev/null -w '%{http_code}\n'   # 200
 
 # 2. what Muse can see: expect sys_info, vm_status (always present) and the allowlisted tools,
 #    and no mouse/key/exec
 curl -s -H "Authorization: Bearer $MUSE_TOKEN" -H 'Content-Type: application/json' \
   -H 'Accept: application/json, text/event-stream' \
-  -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' https://<switchboard>/mcp/macmini
+  -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' https://<switchboard>/mcp/mac-1
 
 # 3. a forbidden tool is refused by the switchboard policy
-#    tools/call name=mouse  → text result "tool mouse is not allowed for muse on macmini …"
+#    tools/call name=mouse  → text result "tool mouse is not allowed for muse on mac-1 …"
 ```
 
 Then have Muse call `browser_navigate` to an IP-echo page and compare with your home
@@ -286,21 +286,20 @@ Reported by Muse on 2026-10-26, from its connector docs and a live check against
 The computer reported `accessibility=false` in `sys_info`, so `mouse` and `key` would fail on
 permissions there even if policy allowed them.
 
-### Re-run against the switchboard on p1 (2026-10-26)
+### Re-run against the switchboard on a tailnet host (2026-10-26)
 
 | Step | Result |
 |---|---|
-| Stock template, `https://p1.<tailnet>.ts.net/mcp/macmini`, port 443 | Works unchanged **through the tailnet proxy**; fails through the default egress proxy (see above) |
+| Stock template, `https://<name>.<tailnet>.ts.net/mcp/mac-1`, port 443 | Works unchanged **through the tailnet proxy**; fails through the default egress proxy (see above) |
 | `tools/list` | 11 tools: `sys_info`, `screenshot`, 8 browser tools, `vm_status`. No `mouse`, `key`, `exec`, `browser_evaluate` |
-| `sys_info` / `vm_status` | macOS 15.7.4, Apple M4, Screen Recording on, Full Disk Access on, Accessibility off; `macmini` attached and ready, max 8 in flight |
+| `sys_info` / `vm_status` | macOS 15.7.4, Apple M4, Screen Recording on, Full Disk Access on, Accessibility off; `mac-1` attached and ready, max 8 in flight |
 | `mouse` | Refused by switchboard policy as a normal tool result; later calls kept working |
-| IP-echo page | One address returned, **different from Muse's own egress address**. The address itself was withheld on purpose. Looked up by Muse: AS18616, Natural Wireless, LLC; hosting, mobile and proxy flags all false |
+| IP-echo page | One address returned, **different from Muse's own egress address**. The address itself was withheld on purpose. Looked up by Muse: a consumer ISP; hosting, mobile and proxy flags all false |
 | Screenshots | `screenshot` (whole desktop): 2.7 s, JPEG 1920x1080, about 165 KB, intact. `browser_take_screenshot` (viewport): 0.8 s, PNG about 7.5 KB, intact |
 | Persistent profile | A site the profile is signed in to loaded its signed-in interface, with no login wall or captcha. No account details were recorded |
 | Latency | list-tools 0.8 to 1.1 s; `sys_info` 1.1 s; `browser_navigate` 2.7 s (IP-echo), 10.9 s (signed-in site); first manual `initialize` through the proxy 17 s. Nothing over 45 s |
 
-The Mac mini's own egress, looked up separately by the operator, is the same network: AS18616, Natural
-Wireless, LLC, a fixed-wireless ISP. So the browser call leaves from the Mac mini's network, and that
+The computer's own egress, looked up separately by the operator, is the same network: a consumer ISP. So the browser call leaves from the computer's network, and that
 network is consumer ISP egress rather than a cloud or datacenter one. An ASN and organisation do not
 prove a connection is residential in the strictest sense.
 
@@ -308,13 +307,13 @@ prove a connection is residential in the strictest sense.
 
 - **Tailnet proxy.** A client for a tailnet-only host has to use Muse's tailnet proxy (the egress proxy
   host, port 3130). The connector descriptor has no proxy setting, so Muse added a small wrapper
-  (`run-p1`) next to the stock client that derives the proxy from `HTTPS_PROXY`, swaps the port to 3130
+  (`run-<name>`) next to the stock client that derives the proxy from `HTTPS_PROXY`, swaps the port to 3130
   and runs the stock client unchanged. If the runtime stops offering that proxy, the wrapper fails
   the same way as the default proxy did.
 - **"Always allow" is a network rule, not a credential scope.** The site approval created an allow
-  rule for `tailb836bb.ts.net` and `*.tailb836bb.ts.net` on ports 80 and 443. It lets Muse's sandbox
+  rule for `<tailnet>.ts.net` and `*.<tailnet>.ts.net` on ports 80 and 443. It lets Muse's sandbox
   connect; it does not grant a token. The credential is registered for the single host
-  `p1.<tailnet>.ts.net` and is only substituted for that host. The rule can be narrowed in the Muse app
+  `<name>.<tailnet>.ts.net` and is only substituted for that host. The rule can be narrowed in the Muse app
   under Settings > Permissions; the agent itself cannot change it.
 - **Key rotation.** Rotating the Muse token on the switchboard does not need a new host registration:
   reconnect the existing connection through the secure API-access flow with the same provider, host,

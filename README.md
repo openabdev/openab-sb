@@ -36,7 +36,7 @@ flowchart LR
     end
 
     subgraph home["Your network — outbound only"]
-        subgraph macmini["Computer: macmini"]
+        subgraph mac1["Computer: mac-1"]
             imcp["OpenAB Computer<br/>switchboard mode"]
             browser["Private browser<br/>your IP, your profile"]
             imcp --> browser
@@ -56,7 +56,7 @@ flowchart LR
 Thick links are WebSockets, and each label says which side dials. Calls always flow from
 the callers toward a computer: a computer dials in and then serves MCP on its own socket,
 and the switchboard dials the pod and then answers the pod's requests on that socket. TLS
-comes from whatever fronts the switchboard (`tailscale serve` or `cloudflared`; see Run).
+comes from whatever fronts the switchboard (`tailscale serve`, a Tailscale sidecar in a pod, or `cloudflared`; see Run).
 
 ## Use your own browser, not the cloud VM's
 
@@ -118,7 +118,7 @@ proxy, a public front) depends on that agent's own network rules.
 max_inflight = 8               # default for every computer
 
 [[computer]]
-name = "macmini"               # 1-64 chars of [A-Za-z0-9_-]; no `.`
+name = "mac-1"               # 1-64 chars of [A-Za-z0-9_-]; no `.`
 secret_sha256 = "sha256:…"     # the identity. The name is just a label
 
 [[computer]]
@@ -129,13 +129,13 @@ max_inflight = 4               # optional override
 [[client]]
 name = "muse"
 token_sha256 = "sha256:…"
-computers = { macmini = ["sys_info", "screenshot"] }   # deny by default
+computers = { mac-1 = ["sys_info", "screenshot"] }   # deny by default
 max_inflight = 4               # this caller's share of one computer
 
 [[client]]
-name = "pahud"
+name = "owner"
 token_sha256 = "sha256:…"
-default_computer = "macmini"                           # what bare /mcp means
+default_computer = "mac-1"                           # what bare /mcp means
 computers = { "*" = ["*"] }    # owner: every computer, including ones added later
 
 [[pty_attach]]
@@ -149,7 +149,7 @@ tools = ["*"]
 | Rule | |
 |---|---|
 | identity | the verifier. Whoever holds a computer's secret answers as that computer, so a leaked secret is replaced, not tolerated. Anything a computer reports about itself (`serverInfo`, hostname, forwarded headers) is shown, never trusted |
-| names | computers are `[A-Za-z0-9_-]`, 1-64 chars. `.` is refused, because a bare TOML key such as `rpi1.local` is a dotted key. Client and pty-attach names keep `.`, and they are a separate namespace from computer names (audit lines carry `principal` and `computer` separately) |
+| names | computers are `[A-Za-z0-9_-]`, 1-64 chars. `.` is refused, because a bare TOML key such as `host.local` is a dotted key. Client and pty-attach names keep `.`, and they are a separate namespace from computer names (audit lines carry `principal` and `computer` separately) |
 | verifiers | unique across every computer and every client |
 | access | `computers` may not be empty; a computer missing from it does not exist for that caller, on every route. `"*"` may not be mixed with names |
 | `default_computer` | required for a `"*"` caller and for anyone who names more than one computer; optional (and implied) when exactly one is reachable. It must be a computer that caller may reach |
@@ -186,8 +186,19 @@ may use.
 | `max_inflight`, global or per computer | reloaded, and applied to that computer's next attach. A live socket keeps the value it attached with |
 | Per-caller `max_inflight` | from that caller's next call |
 | A `[[pty_attach]]`'s `computer`, `tools` or `max_inflight` | swapped on the running attach, from its next request, so a renamed computer keeps serving that pod |
-| `[[pty_attach]]` added or removed, or its `url` or `secret_file`, `listen`, timeouts | need a restart; each is logged at `warn` on reload |
-| `audit_path`, `audit_args`, `audit_redact_keys` | need a restart |
+| `[[pty_attach]].allow_insecure_transport` | takes effect only at startup. A reload reads it only to validate the `url` (a non-loopback `ws://` without it is refused), so an invalid pair rejects the whole reload |
+| `[[pty_attach]]` added or removed, or its `url` or `secret_file` changed | need a restart; each is logged at `warn` on reload (a removed block keeps dialling under its old policy) |
+| `listen`, `[timeouts]` | need a restart; the reload log line names them, and nothing else warns |
+| `allow_insecure_bind` | takes effect only at startup (a reload reads it only to validate `listen`). A reload whose `listen` and `allow_insecure_bind` would not pass `check` (a non-loopback `listen` without it) is rejected whole, like any invalid file |
+| `audit_path`, `audit_args`, `audit_redact_keys` | need a restart; a reload that sees a change logs a `warn` |
+
+A reload re-reads and validates the whole file. If it does not validate, the error is logged
+(`reload failed; keeping the old credentials`) and the running configuration stays as it was, so
+a bad edit changes nothing. A successful reload writes a `config_reloaded` audit line.
+
+In a pod, editing the mounted config does not by itself reload anything: the switchboard
+re-reads the file only on `SIGHUP`. The switchboard is the image's entrypoint, so signal that
+process, or restart the pod for any change in the restart rows above.
 
 The computer table is swapped before client auth, so a daemon presenting a newly added
 secret is never refused with `4003` — which would tell it to stop.
@@ -230,6 +241,8 @@ with `audit_args = true` and callers may have sent secrets (`ui_action` `set_val
 
 ## Run
 
+There are three ways to run it: a release binary on a host, a build from source, or the
+[container image](#container-image) in a pod ([sidecar setup](#run-in-a-pod-behind-a-tailscale-sidecar)).
 Releases ship a static Linux binary (amd64, arm64) and a macOS arm64 binary:
 
 ```bash
@@ -255,7 +268,8 @@ There is no self-registration.
 
 ### Container image
 
-Each `v*` tag publishes a multi-arch (amd64, arm64) image to GHCR. The image job runs only after
+Each `v*` tag publishes a multi-arch (amd64, arm64) image to GHCR, from the same static binaries as
+the release tarballs (`.github/workflows/release.yml`, job `image`). The image job runs only after
 the GitHub Release for the tag has been created. A stable tag (no prerelease suffix) also moves
 `:latest`. A prerelease tag does not.
 
@@ -263,18 +277,19 @@ the GitHub Release for the tag has been created. A stable tag (no prerelease suf
 docker pull ghcr.io/openabdev/openab-sb:0.3.0     # also :0.3 and :latest
 ```
 
-A new GHCR package starts private, so anonymous `docker pull` fails until someone sets it to
-Public once: open the `openab-sb` package under the openabdev org, then Package settings, then
-Change visibility to Public. Authenticated pulls work before that change.
+The tags are the full version (`0.3.0`) and `major.minor` (`0.3`). v0.3.0 is the first release that
+publishes the image automatically on a `v*` tag; earlier releases have no image. The GHCR package is
+public, so `docker pull` and an unauthenticated image pull in a cluster work without credentials.
+(A new GHCR package starts private, and the release notes ask the maintainer to set it to Public once.)
 
 The image is `debian:bookworm-slim` with the release's static `openab-sb` binary, `curl` and
 `ca-certificates`. It runs as the non-root user `openab-sb` (UID and GID 10001), and its entrypoint is
 `openab-sb serve -c /etc/openab-sb/openab-sb.toml`. The config is not baked in: mount it at that
-path. It must set `listen = "127.0.0.1:8790"` and an `audit_path` under `/var/lib/openab-sb`,
-which the image creates and owns for the audit file.
+path. For a pod, keep `listen = "127.0.0.1:8790"` (the default, `src/config.rs`) so only the
+sidecar reaches it, and put `audit_path` (optional) under `/var/lib/openab-sb`, the directory the
+image creates and chowns to the runtime user (`Dockerfile`), so the non-root process can write it.
 
-A pod can probe the switchboard with `curl -fsS --max-time 2 http://127.0.0.1:8790/healthz` from inside the
-container. Keep the listener on loopback, and put TLS in a sidecar such as `tailscale serve`.
+### TLS in front
 
 The switchboard binds loopback and refuses anything else unless you set
 `allow_insecure_bind = true`. Put TLS in front of it:
@@ -285,7 +300,185 @@ The switchboard binds loopback and refuses anything else unless you set
   `cloudflared`. The bearer tokens are then the only gate, so keep them long (the generated
   ones are 256-bit) and rotate them with `SIGHUP`.
 
-Routes:
+**A computer attach needs `wss://`.** OpenAB Computer (the Mac agent in
+[openabdev/instance-mcp](https://github.com/openabdev/instance-mcp)) dials `/vm/attach` in
+switchboard mode and, in its `Switchboard.swift`, refuses a `ws://` URL to any host that is not
+loopback ("ws:// is only allowed to loopback; use wss://"). A plain `http://<ip>:8790` front is
+therefore not enough for a Mac: the switchboard needs an HTTPS front. (The refusal is in that
+project, not in this repository;
+the contract page says the same in general terms: never send the secret over plain `ws://` across a
+network you do not control, see [`docs/SOUTHBOUND-CONTRACT.md`](docs/SOUTHBOUND-CONTRACT.md).) The
+switchboard's own `[[pty_attach]]` dialer has a comparable rule: `ws://` to a non-loopback host is
+refused unless `allow_insecure_transport = true` is set on that block.
+
+### Run in a pod behind a Tailscale sidecar
+
+The image is meant for a pod with two containers. The switchboard listens on pod loopback only. A
+Tailscale sidecar joins the tailnet and serves the HTTPS front itself. Callers outside the pod
+reach the switchboard only through the sidecar. Containers in a pod share one network namespace, so
+any other container in the same pod can also reach `127.0.0.1:8790`.
+
+```mermaid
+flowchart LR
+    clients["Callers and computers<br/>on the tailnet"] -- "HTTPS 443" --> ts
+    subgraph pod["Pod"]
+        ts["tailscale sidecar<br/>userspace mode<br/>serves the HTTPS front"]
+        sb["openab-sb container<br/>listen 127.0.0.1:8790"]
+        ts -- "proxy to loopback" --> sb
+    end
+    clients -. "plain HTTP 8790, userspace forward" .-> ts
+    cfg[("config mounted at<br/>/etc/openab-sb")] -.-> sb
+```
+
+- **Loopback bind.** `listen = "127.0.0.1:8790"` keeps the switchboard off the pod IP. Containers in
+  one pod share a network namespace, so the sidecar reaches it at `127.0.0.1:8790` and nothing
+  outside the pod can, except through the sidecar.
+- **Userspace sidecar.** Run the Tailscale container in userspace networking mode
+  (`TS_USERSPACE=true`), which needs no `/dev/net/tun` and no added capabilities, so the pod can
+  run non-root with all capabilities dropped. The image's UID `10001` is numeric so that
+  `runAsNonRoot` can be verified by the kubelet. A userspace sidecar also forwards inbound tailnet
+  TCP on any port to the same port on pod loopback, so tailnet peers can reach
+  `http://<pod tailnet IP>:8790` directly (plain HTTP inside WireGuard), beside the HTTPS front.
+  Callers could use that. A Mac computer cannot, because it needs `wss://`. Use the HTTPS front for
+  everything. (This forwarding is behavior of Tailscale's userspace mode, not of this repository.)
+- **HTTPS from the sidecar.** Give the sidecar a serve config (`TS_SERVE_CONFIG`, a file in
+  Tailscale's serve-config JSON format) that terminates HTTPS on 443 and proxies `/` to
+  `http://127.0.0.1:8790`. Tailscale substitutes `${TS_CERT_DOMAIN}` with the node's full MagicDNS name
+  (`<name>.<tailnet>.ts.net`). To keep the front tailnet-only, do not enable Funnel for it (a
+  serve config can state `"AllowFunnel": { "${TS_CERT_DOMAIN}:443": false }`):
+
+  ```json
+  {
+    "TCP": { "443": { "HTTPS": true } },
+    "AllowFunnel": { "${TS_CERT_DOMAIN}:443": false },
+    "Web": {
+      "${TS_CERT_DOMAIN}:443": {
+        "Handlers": { "/": { "Proxy": "http://127.0.0.1:8790" } }
+      }
+    }
+  }
+  ```
+
+  The tailnet needs HTTPS certificates enabled. The front is then
+  `https://<name>.<tailnet>.ts.net`, and computers attach to
+  `wss://<name>.<tailnet>.ts.net/vm/attach`. Use the Tailscale documentation for the sidecar's
+  environment variables; this repository only ships the switchboard image.
+- **Probes.** Kubernetes httpGet probes target the pod IP, which the loopback listener does not
+  serve. The image includes `curl`, so use an exec probe that runs inside the container against
+  the loopback listener, for both liveness and readiness:
+
+  ```yaml
+  livenessProbe:
+    exec:
+      command: ["curl", "-fsS", "--max-time", "2", "http://127.0.0.1:8790/healthz"]
+  readinessProbe:
+    exec:
+      command: ["curl", "-fsS", "--max-time", "2", "http://127.0.0.1:8790/healthz"]
+  ```
+
+  `/healthz` is 200 whenever the process runs and never depends on a computer. Do **not** use
+  `/readyz` as the pod's probe: it answers `503` with the body `vm offline` until a computer has
+  attached and finished the MCP handshake, so a pod probed on it would stay not ready for as long
+  as no computer is attached. `/readyz` and `/readyz/<computer>` are for monitoring.
+- **Deployed by OpenAB Connect.** OpenAB Connect (the Mac app) can deploy this image to a k3s or
+  Kubernetes cluster in this shape, with a Tailscale sidecar. The HTTPS front is an option of the
+  Connect deploy (it is not implied by deploying the pod), and Connect can import an existing config
+  (below). Connect is not part of this repository; see its own documentation for what it renders.
+
+#### Request and attach path
+
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant F as HTTPS front
+    participant S as openab-sb
+    participant M as Mac computer
+    Note over C,M: No computer attached yet
+    C->>F: GET /readyz/mac-1 with a client token
+    F->>S: forwarded to 127.0.0.1:8790
+    S-->>F: 503 vm offline
+    F-->>C: 503 vm offline
+    C->>F: POST /mcp/mac-1 tools/call
+    F->>S: forwarded
+    S-->>F: tool result with isError, the VM is not connected
+    F-->>C: tool result with isError
+    M->>F: dial wss /vm/attach over WSS with its secret
+    F->>S: WebSocket upgrade
+    S->>M: initialize
+    M-->>S: initialize result
+    S->>M: notifications/initialized
+    Note over S,M: The computer is now ready
+    C->>F: GET /readyz/mac-1
+    F->>S: forwarded
+    S-->>F: 200 ok
+    F-->>C: 200 ok
+    C->>F: POST /mcp/mac-1 tools/call
+    F->>S: forwarded
+    S->>M: tools/call over the same socket
+    M-->>S: result
+    S-->>F: result
+    F-->>C: result
+```
+
+The unauthenticated `GET /readyz` behaves the same way but names nothing: 200 `ok` once any
+computer is ready, otherwise `503` `vm offline`.
+
+### Import an existing config
+
+The config holds only `sha256:` verifiers, never secrets, so an existing `openab-sb.toml` from a
+hand-installed switchboard can be mounted in the pod as it is, and every computer and client keeps
+its secret and token. Change only what the container shape needs, then validate it:
+
+1. Set `listen = "127.0.0.1:8790"`. Remove `allow_insecure_bind` if the old install set it (it is
+   only needed for a non-loopback `listen`).
+2. If the config sets `audit_path`, point it at a file under `/var/lib/openab-sb`, which the image
+   owns, so the non-root user can write it.
+3. A `[[pty_attach]]` block keeps working only if its `secret_file` exists inside the pod. Mount
+   that file, or leave such blocks out.
+4. Run `openab-sb check -c /etc/openab-sb/openab-sb.toml` in the pod (or the same binary anywhere
+   against the same file). It applies every rule in [Config](#config).
+
+OpenAB Connect's "Use an existing config…" option imports a config file you pick. It rewrites only
+`listen` and `audit_path`, and refuses a file that contains `allow_insecure_*` settings or
+`[[pty_attach]]` blocks rather than removing them (behavior of Connect, not of this repository).
+
+### Migrating from a hand-installed switchboard
+
+Run the new pod beside the old install, move the computers and then the clients, and keep the old
+install as the rollback until the new one has been stable. The old and new switchboards can start
+from the same config because it holds only verifiers. Do that only for a config without
+`[[pty_attach]]` blocks: two switchboards dialling the same pod session would contend, so disable
+those blocks on the standby copy until cutover. A computer is attached to whichever switchboard its
+URL names, so moving a computer is a change of its configured URL.
+
+```mermaid
+flowchart TD
+    old["Old install<br/>host service and its HTTPS front"]
+    new["Connect-deployed switchboard pod<br/>https://#lt;name#gt;.#lt;tailnet#gt;.ts.net"]
+    s1["Step 1: Deploy the pod beside the old install<br/>with the imported config"]
+    s2["Step 2: Check the new front<br/>healthz is 200, readyz is 503 vm offline"]
+    s3["Step 3: Repoint each computer to the new wss URL<br/>and restart its agent"]
+    s4["Step 4: Repoint each client to the new https URL"]
+    s5["Step 5: Verify readyz 200 and one real call per client"]
+    s6["Step 6: Keep the old install stopped but installed<br/>until the new one is stable"]
+    s7["Step 7: Remove the old install and its serve entry"]
+    old --> s1 --> s2 --> s3 --> s4 --> s5 --> s6 --> s7
+    s1 -.-> new
+    s5 -. "problem: point URLs back" .-> old
+```
+
+Practical notes, each following from the design above:
+
+- The computer needs a configuration change of its attach URL, which must be `wss://`
+  (see [TLS in front](#tls-in-front)). Clients only change the base URL of their `/mcp/<computer>`.
+- While the new pod is up and no computer has moved, its `/readyz/<computer>` is `503`, and a client
+  that already points at it sees "the VM is not connected" rather than "unreachable".
+- A computer dials the one URL it is configured with. After it moves, the old switchboard's
+  `/readyz/<computer>` becomes `503` `vm offline`. That is expected.
+- Rolling back is changing the same URLs back, restarting the computer's agent, and starting the
+  old install again if you stopped it. Nothing on the new pod needs to change.
+
+### Routes
 
 | Route | Auth | |
 |---|---|---|
@@ -294,8 +487,8 @@ Routes:
 | `GET /computers` | client token | `[{ "name", "default", "attached", "ready" }]` for this caller's computers |
 | `GET /vm/attach` | computer secret | southbound WebSocket |
 | `GET /healthz` | none | liveness; never depends on a computer |
-| `GET /readyz` | none | 200 when any computer is ready. No names, no counts, so an unauthenticated probe learns nothing about the fleet |
-| `GET /readyz/{computer}` | client token | 200 ready, 503 offline |
+| `GET /readyz` | none | 200 when any computer is ready, else 503 `vm offline`. No names, no counts, so an unauthenticated probe learns nothing about the fleet |
+| `GET /readyz/{computer}` | client token | 200 ready, 503 `vm offline` |
 | `GET /status` | client token | switchboard and per-computer state for this caller's computers |
 
 A computer a caller may not use and one that does not exist give the same `404` with the
