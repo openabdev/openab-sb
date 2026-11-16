@@ -453,7 +453,7 @@ URL names, so moving a computer is a change of its configured URL.
 ```mermaid
 flowchart TD
     old["Old install<br/>host service and its HTTPS front"]
-    new["New pod<br/>https://&lt;name&gt;.&lt;tailnet&gt;.ts.net"]
+    new["New pod<br/>https://#lt;name#gt;.#lt;tailnet#gt;.ts.net"]
     s1["Step 1: Deploy the pod beside the old install<br/>with the imported config"]
     s2["Step 2: Check the new front<br/>healthz is 200, readyz is 503 vm offline"]
     s3["Step 3: Repoint each computer to the new wss URL<br/>and restart its agent"]
